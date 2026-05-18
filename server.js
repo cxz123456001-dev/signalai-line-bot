@@ -14,6 +14,7 @@ const USER_ID   = process.env.LINE_USER_ID;
 const MIN_SCORE = parseInt(process.env.MIN_SCORE || '65');
 const WATCH_PAIRS = ['BTC-USDT', 'ETH-USDT', 'XRP-USDT', 'SOL-USDT'];
 const pendingOrders = {};
+const waitingInput = {}; // 等待用戶輸入金額+槓桿
 
 async function fetchCandles(instId) {
   const { data } = await axios.get('https://www.okx.com/api/v5/market/candles', {
@@ -117,28 +118,63 @@ app.post('/webhook', middleware(lineConfig), async (req, res) => {
     if (event.type !== 'message' || event.message.type !== 'text') continue;
     const text = event.message.text.trim();
     const tok = event.replyToken;
+
+    // 等待輸入金額+槓桿
+    if (waitingInput[USER_ID]) {
+      const match = text.match(/^(\d+(?:\.\d+)?)\s+(\d+)x?$/i);
+      if (match) {
+        const amount = parseFloat(match[1]);
+        const leverage = parseInt(match[2]);
+        const { pair, analysis } = waitingInput[USER_ID];
+        const a = analysis;
+        const isLong = a.dir === 'long';
+
+        // 計算止盈止損金額
+        const slPct = Math.abs((a.sl - a.entry) / a.entry);
+        const tpPct = Math.abs((a.tp - a.entry) / a.entry);
+        const positionSize = amount * leverage;
+        const slAmount = (positionSize * slPct).toFixed(2);
+        const tpAmount = (positionSize * tpPct).toFixed(2);
+        const fee = (positionSize * 0.0005).toFixed(2); // 0.05% 手續費
+
+        const reply =
+          `✅ 下單計算結果\n\n` +
+          `交易對：${pair.replace('-','/')} ${isLong?'做多📈':'做空📉'}\n` +
+          `━━━━━━━━━━━━\n` +
+          `💰 本金：$${amount} USDT\n` +
+          `⚡ 槓桿：${leverage}x\n` +
+          `📊 倉位：$${positionSize} USDT\n` +
+          `━━━━━━━━━━━━\n` +
+          `🟢 進場價：${a.entry.toFixed(4)}\n` +
+          `🎯 止盈價：${a.tp.toFixed(4)}（+$${tpAmount}）\n` +
+          `🛑 止損價：${a.sl.toFixed(4)}（-$${slAmount}）\n` +
+          `━━━━━━━━━━━━\n` +
+          `📈 R/R：${a.rr}:1\n` +
+          `💸 預估手續費：$${fee}\n\n` +
+          `📌 請前往 OKX 執行下單！`;
+
+        await client.replyMessage(tok, { type: 'text', text: reply });
+        delete waitingInput[USER_ID];
+        delete pendingOrders[pair];
+      } else {
+        await client.replyMessage(tok, { type: 'text', text: '⚠️ 格式錯誤，請輸入：金額 槓桿\n例如：100 10x 或 500 20x' });
+      }
+      continue;
+    }
+
     if (text === 'myid') {
       await client.replyMessage(tok, { type: 'text', text: `你的 User ID：\n${event.source.userId}` });
     } else if (text.startsWith('確認下單')) {
       const pair = text.replace('確認下單','').trim();
       const o = pendingOrders[pair];
       if (!o) { await client.replyMessage(tok, { type: 'text', text: `⚠️ 找不到 ${pair} 訂單。` }); continue; }
-      const a = o.analysis;
-      await client.replyMessage(tok, { type: 'text', text: `✅ 確認下單\n${pair.replace('-','/')} ${a.dir==='long'?'做多':'做空'}\n進場：${a.entry.toFixed(4)}\n目標：${a.tp.toFixed(4)}\n止損：${a.sl.toFixed(4)}\nR/R：${a.rr}:1\n\n📌 請前往 OKX 執行。` });
-      delete pendingOrders[pair];
+      waitingInput[USER_ID] = o;
+      await client.replyMessage(tok, {
+        type: 'text',
+        text: `💰 請輸入本金金額和槓桿倍數\n\n格式：金額 槓桿\n例如：100 10x\n\n當前訊號：${pair.replace('-','/')} ${o.analysis.dir==='long'?'做多':'做空'}\n進場價：${o.analysis.entry.toFixed(4)}\n止盈：${o.analysis.tp.toFixed(4)}\n止損：${o.analysis.sl.toFixed(4)}`
+      });
     } else if (text.startsWith('跳過')) {
       const pair = text.replace('跳過','').trim();
       delete pendingOrders[pair];
       await client.replyMessage(tok, { type: 'text', text: `⏭️ 已跳過 ${pair.replace('-','/')}。` });
-    } else if (text === '狀態') {
-      await client.replyMessage(tok, { type: 'text', text: `🤖 SignalAI\n待確認：${Object.keys(pendingOrders).length} 筆\n監控：${WATCH_PAIRS.join(', ')}\n門檻：${MIN_SCORE}分\n\n傳「掃描」立即掃描` });
-    } else if (text === '掃描') {
-      await client.replyMessage(tok, { type: 'text', text: '🔍 掃描中…' });
-      scanAndPush();
     }
-  }
-});
-
-cron.schedule('*/3 * * * *', scanAndPush);
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => { console.log(`🚀 Bot 啟動 Port ${PORT}`); scanAndPush(); });
