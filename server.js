@@ -139,6 +139,6 @@ app.post('/webhook', middleware(lineConfig), async (req, res) => {
   }
 });
 
-cron.schedule('*/15 * * * *', scanAndPush);
+cron.schedule('*/3 * * * *', scanAndPush);
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => { console.log(`🚀 Bot 啟動 Port ${PORT}`); scanAndPush(); });
