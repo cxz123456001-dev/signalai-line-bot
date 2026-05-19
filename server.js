@@ -163,18 +163,39 @@ app.post('/webhook', middleware(lineConfig), async (req, res) => {
     }
 
     if (text === 'myid') {
-      await client.replyMessage(tok, { type: 'text', text: `你的 User ID：\n${event.source.userId}` });
-    } else if (text.startsWith('確認下單')) {
-      const pair = text.replace('確認下單','').trim();
-      const o = pendingOrders[pair];
-      if (!o) { await client.replyMessage(tok, { type: 'text', text: `⚠️ 找不到 ${pair} 訂單。` }); continue; }
-      waitingInput[USER_ID] = o;
-      await client.replyMessage(tok, {
-        type: 'text',
-        text: `💰 請輸入本金金額和槓桿倍數\n\n格式：金額 槓桿\n例如：100 10x\n\n當前訊號：${pair.replace('-','/')} ${o.analysis.dir==='long'?'做多':'做空'}\n進場價：${o.analysis.entry.toFixed(4)}\n止盈：${o.analysis.tp.toFixed(4)}\n止損：${o.analysis.sl.toFixed(4)}`
-      });
-    } else if (text.startsWith('跳過')) {
-      const pair = text.replace('跳過','').trim();
-      delete pendingOrders[pair];
-      await client.replyMessage(tok, { type: 'text', text: `⏭️ 已跳過 ${pair.replace('-','/')}。` });
+      await client.replyMessage(tok, { type: 'text', text: `您的 User ID 是：\n${event.source.userId}` });
+      continue;
     }
+
+    // 處理確認下單點擊
+    if (text.startsWith('確認下單 ')) {
+      const pair = text.replace('確認下單 ', '');
+      if (pendingOrders[pair]) {
+        waitingInput[USER_ID] = pendingOrders[pair];
+        await client.replyMessage(tok, { type: 'text', text: `請輸入該筆交易的【金額】和【槓桿】，中間用空格分開：\n例如：100 10x` });
+      } else {
+        await client.replyMessage(tok, { type: 'text', text: '❌ 找不到對應的掛單訊號或已過期。' });
+      }
+      continue;
+    }
+
+    if (text.startsWith('跳過 ')) {
+      const pair = text.replace('跳過 ', '');
+      delete pendingOrders[pair];
+      await client.replyMessage(tok, { type: 'text', text: `👌 已略過 ${pair} 的訊號通知。` });
+      continue;
+    }
+  }
+});
+
+// 每 4 小時執行一次市場掃描 (配合您使用的 4H K線)
+cron.schedule('0 */4 * * *', () => {
+  console.log('⏰ 開始執行定時市場掃描...');
+  scanAndPush();
+});
+
+// 啟動 Express 伺服器並監聽 Render 指派的 Port
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`🚀 LINE Bot 伺服器已成功啟動，正在監聽連接埠 ${PORT}`);
+});
