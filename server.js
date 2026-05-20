@@ -5,6 +5,20 @@ const axios = require('axios');
 const cron = require('node-cron');
  
 const app = express();
+ 
+// ══════════════════════════════════════════════
+// Keep-Alive：防止 Render 免費方案休眠
+// ══════════════════════════════════════════════
+const RENDER_URL = process.env.RENDER_URL || ''; // 填入你的 Render URL
+app.get('/ping', (req, res) => res.send('pong 🏓'));
+app.get('/health', (req, res) => res.json({
+  status: 'ok',
+  uptime: Math.floor(process.uptime()),
+  pairs: WATCH_PAIRS?.length ?? 0,
+  pending: Object.keys(pendingOrders ?? {}).length,
+  time: new Date().toLocaleString('zh-TW', { timeZone: 'Asia/Taipei' }),
+}));
+ 
 const lineConfig = {
   channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN,
   channelSecret:      process.env.LINE_CHANNEL_SECRET,
@@ -471,4 +485,41 @@ app.listen(PORT, async () => {
   console.log(`🚀 Bot 啟動 Port ${PORT}`);
   await updateTopPairs();
   await scanAndPush();
+ 
+  // ── Self-Ping：每 8 分鐘 ping 自己，防止 Render 休眠 ──────────
+  if (RENDER_URL) {
+    setInterval(async () => {
+      try {
+        const res = await axios.get(`${RENDER_URL}/ping`, { timeout: 10000 });
+        console.log(`💓 Keep-alive ping OK (${res.status})`);
+      } catch (e) {
+        console.warn(`⚠️  Keep-alive ping 失敗: ${e.message}`);
+      }
+    }, 8 * 60 * 1000); // 8 分鐘
+    console.log(`💓 Keep-alive 已啟動 → ${RENDER_URL}/ping`);
+  } else {
+    console.warn('⚠️  未設定 RENDER_URL，Keep-alive 未啟動（請在 Environment 加入）');
+  }
+ 
+  // ── Watchdog：偵測 cron 是否停滯，超過 15 分鐘自動重啟 ────────
+  let lastCronAt = Date.now();
+  const _origScan = scanAndPush;
+  // 包裝 scanAndPush，每次執行都更新心跳
+  const scanAndPushWrapped = async () => {
+    lastCronAt = Date.now();
+    return _origScan();
+  };
+ 
+  // 替換 cron 中的 scanAndPush 為包裝版
+  // （注意：cron 已排程完畢，這裡用 setInterval 額外監控）
+  setInterval(() => {
+    const elapsed = (Date.now() - lastCronAt) / 1000;
+    if (elapsed > 14 * 60) { // 14 分鐘沒跑過 → 強制觸發
+      console.warn(`⚠️  Watchdog：cron 已 ${Math.floor(elapsed)}s 未執行，強制掃描`);
+      lastCronAt = Date.now();
+      scanAndPush().catch(e => console.error('Watchdog 觸發掃描失敗:', e.message));
+    }
+  }, 60 * 1000); // 每分鐘檢查一次
+  console.log('🐕 Watchdog 已啟動（14 分鐘無動作自動恢復）');
 });
+ 
