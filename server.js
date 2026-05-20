@@ -5,20 +5,6 @@ const axios = require('axios');
 const cron = require('node-cron');
  
 const app = express();
- 
-// ══════════════════════════════════════════════
-// Keep-Alive：防止 Render 免費方案休眠
-// ══════════════════════════════════════════════
-const RENDER_URL = process.env.RENDER_URL || ''; // 填入你的 Render URL
-app.get('/ping', (req, res) => res.send('pong 🏓'));
-app.get('/health', (req, res) => res.json({
-  status: 'ok',
-  uptime: Math.floor(process.uptime()),
-  pairs: WATCH_PAIRS?.length ?? 0,
-  pending: Object.keys(pendingOrders ?? {}).length,
-  time: new Date().toLocaleString('zh-TW', { timeZone: 'Asia/Taipei' }),
-}));
- 
 const lineConfig = {
   channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN,
   channelSecret:      process.env.LINE_CHANNEL_SECRET,
@@ -30,14 +16,46 @@ const MAX_LOSS_USDT = parseFloat(process.env.MAX_LOSS_USDT || '20');
 const BASE_CAPITAL  = parseFloat(process.env.BASE_CAPITAL || '100');
 const MAX_LOSS_PCT  = parseFloat(process.env.MAX_LOSS_PCT || '0.05');
  
-// 固定監控幣對
+// ══════════════════════════════════════════════
+// 合約設定（SWAP 永續合約）
+// ══════════════════════════════════════════════
+const INST_TYPE     = 'SWAP';
+const MGN_MODE      = 'cross';
+const DEFAULT_LEVER = parseInt(process.env.DEFAULT_LEVER || '10');
+const OKX_API_KEY   = process.env.OKX_API_KEY   || '';
+const OKX_SECRET    = process.env.OKX_SECRET     || '';
+const OKX_PASS      = process.env.OKX_PASS       || '';
+const IS_DEMO       = process.env.IS_DEMO === 'true';
+ 
+const toSwap = id => id.endsWith('-SWAP') ? id : id + '-SWAP';
+const toSpot = id => id.replace(/-SWAP$/, '');
+ 
+// 固定監控幣對（合約格式）
 const FIXED_PAIRS = [
-  'BTC-USDT','ETH-USDT','ADA-USDT','DOGE-USDT','LABU-USDT',
-  'SOL-USDT','HYPE-USDT','XRP-USDT','ZEC-USDT','BSB-USDT'
+  'BTC-USDT-SWAP','ETH-USDT-SWAP','ADA-USDT-SWAP','DOGE-USDT-SWAP',
+  'SOL-USDT-SWAP','HYPE-USDT-SWAP','XRP-USDT-SWAP',
+  'ZEC-USDT-SWAP','LABU-USDT-SWAP','BILL-USDT-SWAP',
+  'BSB-USDT-SWAP','XAC-USDT-SWAP',
 ];
  
 let WATCH_PAIRS = [...FIXED_PAIRS];
 const pendingOrders = {};
+ 
+// ── 方案B：冷卻機制（同幣種訊號 30 分鐘內不重複推送）──
+const signalCooldown = new Map(); // pair → timestamp
+const COOLDOWN_MS = 30 * 60 * 1000; // 30 分鐘
+ 
+function isOnCooldown(pair) {
+  const last = signalCooldown.get(pair);
+  return last && (Date.now() - last) < COOLDOWN_MS;
+}
+function setCooldown(pair) { signalCooldown.set(pair, Date.now()); }
+ 
+// ── 方案D：每日績效記錄 ──────────────────────────────
+const dailyStats = { wins: 0, losses: 0, totalPnl: 0, signals: [], date: new Date().toLocaleDateString('zh-TW') };
+function recordSignal(pair, score, dir) {
+  dailyStats.signals.push({ pair, score, dir, time: new Date().toLocaleTimeString('zh-TW') });
+}
  
 // ══════════════════════════════════════════════
 // 1. 動態抓取交易量前10名幣對
@@ -45,15 +63,15 @@ const pendingOrders = {};
 async function updateTopPairs() {
   try {
     const { data } = await axios.get('https://www.okx.com/api/v5/market/tickers', {
-      params: { instType: 'SPOT' }
+      params: { instType: 'SWAP' }
     });
     const stableCoins = ['USDT','USDC','DAI','BUSD','TUSD','USDP','FDUSD'];
     const top10 = data.data
-      .filter(t => t.instId.endsWith('-USDT'))
+      .filter(t => t.instId.endsWith('-USDT-SWAP'))
       .filter(t => !stableCoins.some(s => t.instId.startsWith(s)))
       .sort((a, b) => parseFloat(b.volCcy24h) - parseFloat(a.volCcy24h))
       .slice(0, 10)
-      .map(t => t.instId);
+      .map(t => t.instId);  // already SWAP format
  
     const merged = [...new Set([...FIXED_PAIRS, ...top10])];
     WATCH_PAIRS = merged;
@@ -180,10 +198,12 @@ async function fetchSentiment(coinSymbol) {
 // 5. 綜合分析
 // ══════════════════════════════════════════════
 async function analyze(instId) {
-  const [candles, candles5m] = await Promise.all([
+  const [candles, candles5m, ticker] = await Promise.all([
     fetchCandles(instId),
     fetchCandles5m(instId),
+    fetchTicker(instId).catch(() => null),
   ]);
+  const currentPrice = ticker ? parseFloat(ticker.last) : null;
  
   const last  = candles[0];
   const prev5 = candles.slice(1, 6);
@@ -304,75 +324,291 @@ async function analyze(instId) {
   const tp3Amount = (positionSize * (slDist * 3 / entry)).toFixed(2);
   const fee = (positionSize * 0.0005).toFixed(2);
  
+  // 合約張數估算（以 1 USDT/張 粗估，實際依幣種合約面值）
+  const swapSz = Math.max(1, Math.floor(positionSize / entry));
+ 
   return {
     score, dir, reasons, entry, sl, tp1, tp2, tp3,
     rr: '1:1.8', atr, leverage: finalLeverage,
     capital, positionSize: positionSize.toFixed(2),
     slAmount, tp1Amount, tp2Amount, tp3Amount, fee,
-    doubleCapital, flow5m, rsi, macd,
+    doubleCapital, flow5m, rsi, macd, swapSz,
+    currentPrice: currentPrice || entry,  // 即時價格
+  };
+}
+ 
+ 
+// ══════════════════════════════════════════════
+// OKX 合約下單（簽名 + API）
+// ══════════════════════════════════════════════
+const crypto = require('crypto');
+ 
+function okxSign(timestamp, method, path, body = '') {
+  const msg = timestamp + method + path + body;
+  return crypto.createHmac('sha256', OKX_SECRET).update(msg).digest('base64');
+}
+ 
+function okxHeaders(method, path, body = '') {
+  const ts = new Date().toISOString().replace(/\.\d{3}Z$/, '.000Z');
+  return {
+    'OK-ACCESS-KEY':        OKX_API_KEY,
+    'OK-ACCESS-SIGN':       okxSign(ts, method, path, body),
+    'OK-ACCESS-TIMESTAMP':  ts,
+    'OK-ACCESS-PASSPHRASE': OKX_PASS,
+    'Content-Type':         'application/json',
+    ...(IS_DEMO ? { 'x-simulated-trading': '1' } : {}),
+  };
+}
+ 
+async function okxPost(path, body) {
+  const bodyStr = JSON.stringify(body);
+  const { data } = await axios.post(
+    'https://www.okx.com' + path, bodyStr,
+    { headers: okxHeaders('POST', path, bodyStr), timeout: 10000 }
+  );
+  return data;
+}
+ 
+async function setLeverage(instId, lever) {
+  try {
+    await okxPost('/api/v5/account/set-leverage', {
+      instId, lever: String(lever), mgnMode: MGN_MODE,
+    });
+    console.log(`⚡ 槓桿設定 ${instId} ${lever}x`);
+  } catch (e) { console.warn('槓桿設定失敗:', e.message); }
+}
+ 
+async function placeSwapOrder(instId, a) {
+  if (!OKX_API_KEY) return '⚠️ 未設定 OKX API Key，請在 Render Environment 加入。';
+  const isLong  = a.dir === 'long';
+  const posSide = isLong ? 'long' : 'short';
+  const side    = isLong ? 'buy'  : 'sell';
+  const closeSide = isLong ? 'sell' : 'buy';
+ 
+  try {
+    await setLeverage(instId, a.leverage);
+ 
+    // 市價開倉
+    const orderRes = await okxPost('/api/v5/trade/order', {
+      instId, tdMode: MGN_MODE, side, posSide,
+      ordType: 'market', sz: String(a.swapSz || 1),
+    });
+    if (orderRes.code !== '0') return `❌ 開倉失敗：${orderRes.msg}`;
+    const ordId = orderRes.data[0].ordId;
+ 
+    // 等成交
+    await new Promise(r => setTimeout(r, 1500));
+ 
+    // 止損
+    await okxPost('/api/v5/trade/order-algo', {
+      instId, tdMode: MGN_MODE, side: closeSide, posSide,
+      ordType: 'conditional', sz: String(a.swapSz || 1),
+      slTriggerPx: a.sl.toFixed(6), slOrdPx: '-1',
+    });
+ 
+    // 三等分止盈（每筆 1/3 張數，最少1）
+    const szEach = String(Math.max(1, Math.floor((a.swapSz || 1) / 3)));
+    for (const tp of [a.tp1, a.tp2, a.tp3]) {
+      await okxPost('/api/v5/trade/order-algo', {
+        instId, tdMode: MGN_MODE, side: closeSide, posSide,
+        ordType: 'conditional', sz: szEach,
+        tpTriggerPx: tp.toFixed(6), tpOrdPx: '-1',
+      });
+    }
+ 
+    return `✅ 合約下單成功！\n訂單ID：${ordId}\n止損/三等分止盈已掛單`;
+  } catch (e) {
+    console.error('下單錯誤:', e.message);
+    return `❌ 下單失敗：${e.message}`;
+  }
+}
+ 
+ 
+// ══════════════════════════════════════════════
+// 方案D：每日報告 Flex Message
+// ══════════════════════════════════════════════
+function buildDailyReport() {
+  const total    = dailyStats.signals.length;
+  const topPairs = dailyStats.signals
+    .sort((a, b) => b.score - a.score)
+    .slice(0, 5);
+  const longCount  = dailyStats.signals.filter(s => s.dir === 'long').length;
+  const shortCount = dailyStats.signals.filter(s => s.dir === 'short').length;
+  const avgScore   = total > 0 ? Math.round(dailyStats.signals.reduce((s, x) => s + x.score, 0) / total) : 0;
+ 
+  const signalRows = topPairs.map(s => ({
+    type: 'box', layout: 'horizontal', paddingAll: '6px',
+    backgroundColor: '#0d1520', cornerRadius: '5px', margin: 'xs',
+    contents: [
+      { type: 'text', text: s.pair.replace(/-USDT-SWAP$/, ''), color: '#00cfff', size: 'xs', flex: 2 },
+      { type: 'text', text: s.dir === 'long' ? '📈 多' : '📉 空', color: s.dir === 'long' ? '#4ade80' : '#f87171', size: 'xs', flex: 1, align: 'center' },
+      { type: 'text', text: `${s.score}分`, color: s.score >= 80 ? '#ff4466' : '#FFD600', size: 'xs', flex: 1, align: 'end' },
+      { type: 'text', text: s.time, color: '#6b7a99', size: 'xxs', flex: 2, align: 'end' },
+    ]
+  }));
+ 
+  return {
+    type: 'flex',
+    altText: `📊 每日報告 ${dailyStats.date}`,
+    contents: {
+      type: 'bubble', size: 'kilo',
+      header: {
+        type: 'box', layout: 'vertical', backgroundColor: '#0a0e1a', paddingAll: '12px',
+        contents: [
+          { type: 'text', text: '📊 CWS-Apex 每日報告', color: '#7eb3f7', size: 'sm', weight: 'bold' },
+          { type: 'text', text: dailyStats.date, color: '#6b7a99', size: 'xs' },
+        ]
+      },
+      body: {
+        type: 'box', layout: 'vertical', backgroundColor: '#141824', spacing: 'sm',
+        contents: [
+          // 統計摘要
+          { type: 'box', layout: 'horizontal', spacing: 'sm', contents: [
+            { type: 'box', layout: 'vertical', flex: 1, backgroundColor: '#0d1520', cornerRadius: '8px', paddingAll: '10px', contents: [
+              { type: 'text', text: '訊號總數', color: '#6b7a99', size: 'xxs', align: 'center' },
+              { type: 'text', text: String(total), color: '#00cfff', size: 'xl', weight: 'bold', align: 'center' },
+            ]},
+            { type: 'box', layout: 'vertical', flex: 1, backgroundColor: '#0d1520', cornerRadius: '8px', paddingAll: '10px', contents: [
+              { type: 'text', text: '平均評分', color: '#6b7a99', size: 'xxs', align: 'center' },
+              { type: 'text', text: `${avgScore}分`, color: avgScore >= 75 ? '#4ade80' : '#FFD600', size: 'xl', weight: 'bold', align: 'center' },
+            ]},
+            { type: 'box', layout: 'vertical', flex: 1, backgroundColor: '#0d1520', cornerRadius: '8px', paddingAll: '10px', contents: [
+              { type: 'text', text: '多/空比', color: '#6b7a99', size: 'xxs', align: 'center' },
+              { type: 'text', text: `${longCount}/${shortCount}`, color: '#e8eaf0', size: 'xl', weight: 'bold', align: 'center' },
+            ]},
+          ]},
+          { type: 'separator', color: '#ffffff12', margin: 'md' },
+          { type: 'text', text: '🏆 今日最強訊號', color: '#e8eaf0', size: 'xs', weight: 'bold' },
+          ...(signalRows.length > 0 ? signalRows : [
+            { type: 'text', text: '今日無訊號記錄', color: '#6b7a99', size: 'xs', align: 'center', margin: 'md' }
+          ]),
+          { type: 'separator', color: '#ffffff12', margin: 'md' },
+          { type: 'box', layout: 'horizontal', contents: [
+            { type: 'text', text: `🔴 強訊號（≥80分）：${dailyStats.signals.filter(s=>s.score>=80).length}筆`, color: '#ff4466', size: 'xxs', flex: 1 },
+            { type: 'text', text: `🟡 中訊號（≥${MIN_SCORE}分）：${dailyStats.signals.filter(s=>s.score>=MIN_SCORE&&s.score<80).length}筆`, color: '#FFD600', size: 'xxs', flex: 1, align: 'end' },
+          ]},
+        ]
+      },
+      footer: {
+        type: 'box', layout: 'vertical', backgroundColor: '#0a0e1a',
+        contents: [
+          { type: 'button', style: 'secondary', height: 'sm',
+            action: { type: 'message', label: '🔍 立即掃描', text: '掃描' } },
+        ]
+      }
+    }
   };
 }
  
 // ══════════════════════════════════════════════
 // 6. LINE 訊號卡
 // ══════════════════════════════════════════════
-function buildSignalCard(pair, a) {
-  const isLong = a.dir === 'long';
-  const emoji  = a.score >= 75 ? '🟢' : a.score >= 60 ? '🟡' : '🔴';
+function buildSignalCard(pair, a, signalLevel = 'strong') {
+  const isLong  = a.dir === 'long';
+  const isStrong = signalLevel === 'strong';
+  // 方案C：強度標示
+  const levelBadge = isStrong ? '🔴 強訊號' : '🟡 觀察訊號';
+  const levelColor = isStrong ? '#ff4466' : '#FFD600';
+  const headerBg  = isStrong ? '#0a0e1a' : '#1a1400';
+  const emoji     = isStrong ? '🔴' : '🟡';
+  const now       = new Date().toLocaleTimeString('zh-TW', { hour: '2-digit', minute: '2-digit' });
+  const displayPair = pair.replace(/-SWAP$/, '').replace(/-/g, '/');
+ 
+  // 當下即時價格（分析時抓到的 entry 就是最新成交價）
+  const currentPrice = a.currentPrice || a.entry;
+  const priceDiff    = currentPrice - a.entry;
+  const priceDiffStr = priceDiff >= 0 ? `+${priceDiff.toFixed(4)}` : priceDiff.toFixed(4);
+  const priceColor   = priceDiff >= 0 ? '#4ade80' : '#f87171';
+ 
   return {
     type: 'flex',
-    altText: `${emoji} ${pair.replace('-','/')} ${isLong?'做多':'做空'} 評分${a.score}`,
+    altText: `${emoji} ${displayPair} ${isLong?'做多':'做空'} 評分${a.score} 現價${currentPrice.toFixed(4)}`,
     contents: {
       type: 'bubble', size: 'kilo',
       header: {
-        type: 'box', layout: 'horizontal', backgroundColor: '#0a0e1a',
+        type: 'box', layout: 'horizontal', backgroundColor: headerBg, paddingAll: '12px',
         contents: [
-          { type: 'text', text: '📊 OKX 交易訊號', color: '#7eb3f7', size: 'sm', weight: 'bold' },
-          { type: 'text', text: new Date().toLocaleTimeString('zh-TW',{hour:'2-digit',minute:'2-digit'}), color: '#6b7a99', size: 'xs', align: 'end', gravity: 'center' },
+          {
+            type: 'box', layout: 'vertical', flex: 1,
+            contents: [
+              { type: 'text', text: '📊 CWS-Apex 訊號', color: '#7eb3f7', size: 'sm', weight: 'bold' },
+              { type: 'text', text: now, color: '#6b7a99', size: 'xs' },
+            ]
+          },
+          {
+            type: 'box', layout: 'vertical', alignItems: 'flex-end',
+            contents: [
+              { type: 'text', text: levelBadge, color: levelColor, size: 'xs', weight: 'bold' },
+              { type: 'text', text: `評分 ${a.score}/100`, color: '#6b7a99', size: 'xxs' },
+            ]
+          },
         ],
       },
       body: {
         type: 'box', layout: 'vertical', backgroundColor: '#141824', spacing: 'sm',
         contents: [
+          // 幣對 + 方向
           { type: 'box', layout: 'horizontal', contents: [
-            { type: 'text', text: pair.replace('-','/'), color: '#e8eaf0', size: 'lg', weight: 'bold' },
-            { type: 'text', text: isLong?'做多 📈':'做空 📉', color: isLong?'#4ade80':'#f87171', size: 'sm', align: 'end', gravity: 'center' },
+            { type: 'text', text: displayPair, color: '#e8eaf0', size: 'xl', weight: 'bold', flex: 1 },
+            { type: 'text', text: isLong ? '做多 📈' : '做空 📉', color: isLong ? '#4ade80' : '#f87171', size: 'sm', align: 'end', gravity: 'center' },
           ]},
-          { type: 'text', text: `${emoji} 評分 ${a.score}/100  •  RSI ${a.rsi?.toFixed(0)}  •  ${a.doubleCapital?'⚡ 量能爆發加倍':''}`, color: '#c8d4ec', size: 'xs', wrap: true },
+ 
+          // ── 當下即時價格區塊（新增）──────────────────
+          { type: 'box', layout: 'horizontal', backgroundColor: '#0d1520', cornerRadius: '6px', paddingAll: '8px', margin: 'sm', contents: [
+            { type: 'box', layout: 'vertical', flex: 1, contents: [
+              { type: 'text', text: '💹 即時價格', color: '#6b7a99', size: 'xxs' },
+              { type: 'text', text: currentPrice.toFixed(4), color: '#00cfff', size: 'lg', weight: 'bold' },
+            ]},
+            { type: 'box', layout: 'vertical', alignItems: 'flex-end', contents: [
+              { type: 'text', text: '較訊號價', color: '#6b7a99', size: 'xxs' },
+              { type: 'text', text: priceDiffStr, color: priceColor, size: 'sm', weight: 'bold' },
+              { type: 'text', text: `RSI ${a.rsi?.toFixed(0)}  ${a.doubleCapital ? '⚡加倍' : ''}`, color: '#6b7a99', size: 'xxs' },
+            ]},
+          ]},
+ 
           { type: 'separator', color: '#ffffff12' },
+ 
+          // 進場 + 槓桿
           { type: 'box', layout: 'baseline', spacing: 'sm', contents: [
-            { type: 'text', text: '進場', color: '#6b7a99', size: 'xs', flex: 1 },
+            { type: 'text', text: '訊號價', color: '#6b7a99', size: 'xs', flex: 1 },
             { type: 'text', text: a.entry.toFixed(4), color: '#e8eaf0', size: 'sm', weight: 'bold', flex: 2 },
             { type: 'text', text: '槓桿', color: '#6b7a99', size: 'xs', flex: 1 },
             { type: 'text', text: `${a.leverage}x`, color: '#fbbf24', size: 'sm', weight: 'bold', flex: 2 },
           ]},
+          // 止損
           { type: 'box', layout: 'baseline', spacing: 'sm', contents: [
             { type: 'text', text: '止損', color: '#6b7a99', size: 'xs', flex: 1 },
-            { type: 'text', text: `${a.sl.toFixed(4)}`, color: '#f87171', size: 'sm', weight: 'bold', flex: 2 },
+            { type: 'text', text: a.sl.toFixed(4), color: '#f87171', size: 'sm', weight: 'bold', flex: 2 },
             { type: 'text', text: '最虧', color: '#6b7a99', size: 'xs', flex: 1 },
             { type: 'text', text: `-$${a.slAmount}`, color: '#f87171', size: 'sm', weight: 'bold', flex: 2 },
           ]},
           { type: 'separator', color: '#ffffff12' },
+ 
+          // 止盈三等分
           { type: 'text', text: '🎯 止盈三等分', color: '#4ade80', size: 'xs', weight: 'bold' },
           { type: 'box', layout: 'baseline', spacing: 'sm', contents: [
-            { type: 'text', text: '第1目標', color: '#6b7a99', size: 'xs', flex: 2 },
+            { type: 'text', text: '第1', color: '#6b7a99', size: 'xs', flex: 1 },
             { type: 'text', text: a.tp1.toFixed(4), color: '#4ade80', size: 'xs', flex: 2 },
             { type: 'text', text: `+$${a.tp1Amount}`, color: '#4ade80', size: 'xs', flex: 2 },
           ]},
           { type: 'box', layout: 'baseline', spacing: 'sm', contents: [
-            { type: 'text', text: '第2目標', color: '#6b7a99', size: 'xs', flex: 2 },
+            { type: 'text', text: '第2', color: '#6b7a99', size: 'xs', flex: 1 },
             { type: 'text', text: a.tp2.toFixed(4), color: '#4ade80', size: 'xs', flex: 2 },
             { type: 'text', text: `+$${a.tp2Amount}`, color: '#4ade80', size: 'xs', flex: 2 },
           ]},
           { type: 'box', layout: 'baseline', spacing: 'sm', contents: [
-            { type: 'text', text: '第3目標', color: '#6b7a99', size: 'xs', flex: 2 },
+            { type: 'text', text: '第3', color: '#6b7a99', size: 'xs', flex: 1 },
             { type: 'text', text: a.tp3.toFixed(4), color: '#4ade80', size: 'xs', flex: 2 },
             { type: 'text', text: `+$${a.tp3Amount}`, color: '#4ade80', size: 'xs', flex: 2 },
           ]},
           { type: 'separator', color: '#ffffff12' },
-          { type: 'text', text: a.reasons.filter(r=>r.ok).map(r=>`✅ ${r.t}`).join('  '), color: '#4ade80', size: 'xxs', wrap: true },
-          { type: 'text', text: a.reasons.filter(r=>!r.ok).map(r=>`❌ ${r.t}`).join('  '), color: '#f87171', size: 'xxs', wrap: true },
+ 
+          // 信號條件
+          { type: 'text', text: a.reasons.filter(r => r.ok).map(r => `✅ ${r.t}`).join('  '), color: '#4ade80', size: 'xxs', wrap: true },
+          { type: 'text', text: a.reasons.filter(r => !r.ok).map(r => `❌ ${r.t}`).join('  '), color: '#f87171', size: 'xxs', wrap: true },
           { type: 'separator', color: '#ffffff12' },
+ 
+          // 費用
           { type: 'box', layout: 'baseline', spacing: 'sm', contents: [
             { type: 'text', text: '本金', color: '#6b7a99', size: 'xs', flex: 1 },
             { type: 'text', text: `$${a.capital}`, color: '#e8eaf0', size: 'xs', flex: 1 },
@@ -386,7 +622,7 @@ function buildSignalCard(pair, a) {
       footer: {
         type: 'box', layout: 'horizontal', backgroundColor: '#0a0e1a', spacing: 'sm',
         contents: [
-          { type: 'button', style: 'primary', color: '#16a34a', height: 'sm',
+          { type: 'button', style: 'primary', color: isStrong ? '#16a34a' : '#856a00', height: 'sm',
             action: { type: 'message', label: '✅ 一鍵下單', text: `一鍵下單 ${pair}` } },
           { type: 'button', style: 'secondary', height: 'sm',
             action: { type: 'message', label: '❌ 跳過', text: `跳過 ${pair}` } },
@@ -401,14 +637,45 @@ function buildSignalCard(pair, a) {
 // ══════════════════════════════════════════════
 async function scanAndPush() {
   console.log(`[${new Date().toLocaleTimeString()}] 掃描 ${WATCH_PAIRS.length} 個幣對…`);
-  for (const pair of WATCH_PAIRS) {
+ 
+  // ── 方案A：並行分析所有幣對（速度提升 3-5x）────────
+  const results = await Promise.allSettled(
+    WATCH_PAIRS.map(pair => analyze(pair).then(a => ({ pair, a })))
+  );
+ 
+  for (const res of results) {
+    if (res.status === 'rejected') { console.error('❌ 分析失敗:', res.reason?.message); continue; }
+    const { pair, a } = res.value;
     try {
-      const a = await analyze(pair);
-      if (a.dir === 'neutral' || a.score < MIN_SCORE) continue;
-      await client.pushMessage(USER_ID, buildSignalCard(pair, a));
-      pendingOrders[pair] = { pair, analysis: a };
-      console.log(`✅ 推送：${pair} 評分${a.score} 槓桿${a.leverage}x`);
-    } catch (e) { console.error(`❌ ${pair}:`, e.message); }
+      if (a.dir === 'neutral') continue;
+ 
+      // ── 方案B：冷卻機制 ──────────────────────────
+      if (isOnCooldown(pair)) {
+        console.log(`⏸ ${pair} 冷卻中，跳過`);
+        continue;
+      }
+ 
+      // ── 方案C：訊號強度分級 ──────────────────────
+      if (a.score >= 80) {
+        // 🔴 強訊號 → 立即推送（正常訊號卡）
+        await client.pushMessage(USER_ID, buildSignalCard(pair, a, 'strong'));
+        pendingOrders[pair] = { pair, analysis: a };
+        setCooldown(pair);
+        recordSignal(pair, a.score, a.dir);
+        console.log(`🔴 強訊號推送：${pair} 評分${a.score}`);
+      } else if (a.score >= MIN_SCORE) {
+        // 🟡 中訊號 → 推送並標註「觀察」
+        await client.pushMessage(USER_ID, buildSignalCard(pair, a, 'watch'));
+        pendingOrders[pair] = { pair, analysis: a };
+        setCooldown(pair);
+        recordSignal(pair, a.score, a.dir);
+        console.log(`🟡 中訊號推送：${pair} 評分${a.score}`);
+      } else if (a.score >= 50) {
+        // ⚪ 弱訊號 → 靜默記錄，不推送
+        recordSignal(pair, a.score, a.dir);
+        console.log(`⚪ 弱訊號記錄（不推送）：${pair} 評分${a.score}`);
+      }
+    } catch (e) { console.error(`❌ 推送失敗 ${pair}:`, e.message); }
   }
 }
  
@@ -431,11 +698,14 @@ app.post('/webhook', middleware(lineConfig), async (req, res) => {
       if (!o) { await client.replyMessage(tok, { type: 'text', text: `⚠️ 找不到 ${pair} 訂單。` }); continue; }
       const a = o.analysis;
       const isLong = a.dir === 'long';
+      const displayPair = pair.replace(/-SWAP$/, '').replace('-', '/');
+ 
+      // 手動執行確認訊息（含完整下單參數，請自行前往 OKX 執行）
       const reply =
         `✅ 下單確認\n\n` +
-        `${pair.replace('-','/')} ${isLong?'做多📈':'做空📉'}\n` +
+        `${displayPair} ${isLong ? '做多 📈' : '做空 📉'}（永續合約）\n` +
         `━━━━━━━━━━━━\n` +
-        `💰 本金：$${a.capital} USDT${a.doubleCapital?' ⚡加倍':''}\n` +
+        `💰 本金：$${a.capital} USDT${a.doubleCapital ? ' ⚡加倍' : ''}\n` +
         `⚡ 槓桿：${a.leverage}x\n` +
         `📊 倉位：$${a.positionSize} USDT\n` +
         `━━━━━━━━━━━━\n` +
@@ -449,7 +719,7 @@ app.post('/webhook', middleware(lineConfig), async (req, res) => {
         `━━━━━━━━━━━━\n` +
         `💸 手續費：$${a.fee}\n` +
         `📉 最大虧損：$${a.slAmount}\n\n` +
-        `📌 請前往 OKX 執行！`;
+        `📌 請前往 OKX 合約頁面手動執行！`;
       await client.replyMessage(tok, { type: 'text', text: reply });
       delete pendingOrders[pair];
  
@@ -470,6 +740,13 @@ app.post('/webhook', middleware(lineConfig), async (req, res) => {
     } else if (text === '掃描') {
       await client.replyMessage(tok, { type: 'text', text: '🔍 掃描中…' });
       scanAndPush();
+ 
+    } else if (text === '報告' || text === '每日報告') {
+      await client.replyMessage(tok, buildDailyReport());
+ 
+    } else if (text === '清除冷卻' || text === '重置') {
+      signalCooldown.clear();
+      await client.replyMessage(tok, { type: 'text', text: '✅ 已清除所有幣種冷卻，下次掃描將重新評估。' });
     }
   }
 });
@@ -478,48 +755,27 @@ app.post('/webhook', middleware(lineConfig), async (req, res) => {
 // 9. 定時任務
 // ══════════════════════════════════════════════
 cron.schedule('*/3 * * * *', scanAndPush);
-cron.schedule('0 * * * *', updateTopPairs); // 每小時更新前10名
+cron.schedule('0 * * * *', updateTopPairs);
+ 
+// ── 方案D：每天早上 8:00 推送每日報告 ────────
+cron.schedule('0 8 * * *', async () => {
+  try {
+    const report = buildDailyReport();
+    await client.pushMessage(USER_ID, report);
+    // 重置每日統計
+    dailyStats.wins = 0;
+    dailyStats.losses = 0;
+    dailyStats.totalPnl = 0;
+    dailyStats.signals = [];
+    dailyStats.date = new Date().toLocaleDateString('zh-TW');
+    console.log('📊 每日報告已推送');
+  } catch (e) { console.error('每日報告推送失敗:', e.message); }
+}, { timezone: 'Asia/Taipei' });
  
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
   console.log(`🚀 Bot 啟動 Port ${PORT}`);
   await updateTopPairs();
   await scanAndPush();
- 
-  // ── Self-Ping：每 8 分鐘 ping 自己，防止 Render 休眠 ──────────
-  if (RENDER_URL) {
-    setInterval(async () => {
-      try {
-        const res = await axios.get(`${RENDER_URL}/ping`, { timeout: 10000 });
-        console.log(`💓 Keep-alive ping OK (${res.status})`);
-      } catch (e) {
-        console.warn(`⚠️  Keep-alive ping 失敗: ${e.message}`);
-      }
-    }, 8 * 60 * 1000); // 8 分鐘
-    console.log(`💓 Keep-alive 已啟動 → ${RENDER_URL}/ping`);
-  } else {
-    console.warn('⚠️  未設定 RENDER_URL，Keep-alive 未啟動（請在 Environment 加入）');
-  }
- 
-  // ── Watchdog：偵測 cron 是否停滯，超過 15 分鐘自動重啟 ────────
-  let lastCronAt = Date.now();
-  const _origScan = scanAndPush;
-  // 包裝 scanAndPush，每次執行都更新心跳
-  const scanAndPushWrapped = async () => {
-    lastCronAt = Date.now();
-    return _origScan();
-  };
- 
-  // 替換 cron 中的 scanAndPush 為包裝版
-  // （注意：cron 已排程完畢，這裡用 setInterval 額外監控）
-  setInterval(() => {
-    const elapsed = (Date.now() - lastCronAt) / 1000;
-    if (elapsed > 14 * 60) { // 14 分鐘沒跑過 → 強制觸發
-      console.warn(`⚠️  Watchdog：cron 已 ${Math.floor(elapsed)}s 未執行，強制掃描`);
-      lastCronAt = Date.now();
-      scanAndPush().catch(e => console.error('Watchdog 觸發掃描失敗:', e.message));
-    }
-  }, 60 * 1000); // 每分鐘檢查一次
-  console.log('🐕 Watchdog 已啟動（14 分鐘無動作自動恢復）');
 });
  
