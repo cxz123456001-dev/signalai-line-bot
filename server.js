@@ -32,8 +32,8 @@ const MAX_LOSS_PCT  = parseFloat(process.env.MAX_LOSS_PCT || '0.05');
  
 // 固定監控幣對
 const FIXED_PAIRS = [
-  'BTC-USDT','ETH-USDT','ADA-USDT','DOGE-USDT',
-  'SOL-USDT','HYPE-USDT','XRP-USDT'
+  'BTC-USDT','ETH-USDT','ADA-USDT','DOGE-USDT','LABU-USDT',
+  'SOL-USDT','HYPE-USDT','XRP-USDT','ZEC-USDT','BSB-USDT'
 ];
  
 let WATCH_PAIRS = [...FIXED_PAIRS];
