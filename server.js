@@ -3,7 +3,7 @@ const express = require('express');
 const { Client, middleware } = require('@line/bot-sdk');
 const axios = require('axios');
 const cron = require('node-cron');
-
+ 
 const app = express();
 const lineConfig = {
   channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN,
@@ -11,11 +11,14 @@ const lineConfig = {
 };
 const client = new Client(lineConfig);
 const USER_ID       = process.env.LINE_USER_ID;
-const MIN_SCORE     = parseInt(process.env.MIN_SCORE || '65');
-const MAX_LOSS_USDT = parseFloat(process.env.MAX_LOSS_USDT || '20');
-const BASE_CAPITAL  = parseFloat(process.env.BASE_CAPITAL || '100');
-const MAX_LOSS_PCT  = parseFloat(process.env.MAX_LOSS_PCT || '0.05');
-
+const MIN_SCORE       = parseInt(process.env.MIN_SCORE     || '65');
+const MAX_LOSS_USDT   = parseFloat(process.env.MAX_LOSS_USDT  || '20');
+const BASE_CAPITAL    = parseFloat(process.env.BASE_CAPITAL   || '100');
+const MAX_LOSS_PCT    = parseFloat(process.env.MAX_LOSS_PCT   || '0.05');
+const DAILY_MAX_LOSS  = parseFloat(process.env.DAILY_MAX_LOSS || '50');  // 每日最大虧損熔斷
+const MIN_VOL_USDT    = parseFloat(process.env.MIN_VOL_USDT   || '5000000'); // 流動性門檻 500萬
+const FUND_RATE_LIMIT = parseFloat(process.env.FUND_RATE_LIMIT|| '0.0008'); // 資金費率極值
+ 
 // ══════════════════════════════════════════════
 // 合約設定（SWAP 永續合約）
 // ══════════════════════════════════════════════
@@ -26,10 +29,10 @@ const OKX_API_KEY   = process.env.OKX_API_KEY   || '';
 const OKX_SECRET    = process.env.OKX_SECRET     || '';
 const OKX_PASS      = process.env.OKX_PASS       || '';
 const IS_DEMO       = process.env.IS_DEMO === 'true';
-
+ 
 const toSwap = id => id.endsWith('-SWAP') ? id : id + '-SWAP';
 const toSpot = id => id.replace(/-SWAP$/, '');
-
+ 
 // ── 動態小數位數（比照 OKX 顯示精度）────────────────
 // 例：0.00009244 → 8位；81600.00 → 2位；1.2345 → 4位
 function getDecimals(price) {
@@ -53,7 +56,7 @@ function fmtDiff(diff, price) {
   const str = diff.toFixed(d);
   return diff >= 0 ? '+' + str : str;
 }
-
+ 
 // 固定監控幣對（合約格式）
 const FIXED_PAIRS = [
   'BTC-USDT-SWAP','ETH-USDT-SWAP','ADA-USDT-SWAP','DOGE-USDT-SWAP',
@@ -61,26 +64,184 @@ const FIXED_PAIRS = [
   'ZEC-USDT-SWAP','LABU-USDT-SWAP','BILL-USDT-SWAP',
   'BSB-USDT-SWAP','XAC-USDT-SWAP',
 ];
-
+ 
 let WATCH_PAIRS = [...FIXED_PAIRS];
 const pendingOrders = {};
-
-// ── 方案B：冷卻機制（同幣種訊號 30 分鐘內不重複推送）──
-const signalCooldown = new Map(); // pair → timestamp
-const COOLDOWN_MS = 30 * 60 * 1000; // 30 分鐘
-
+ 
+// ── 方案B：冷卻機制 ─────────────────────────────────
+const signalCooldown = new Map();
+const COOLDOWN_MS = 30 * 60 * 1000;
 function isOnCooldown(pair) {
   const last = signalCooldown.get(pair);
   return last && (Date.now() - last) < COOLDOWN_MS;
 }
 function setCooldown(pair) { signalCooldown.set(pair, Date.now()); }
-
-// ── 方案D：每日績效記錄 ──────────────────────────────
-const dailyStats = { wins: 0, losses: 0, totalPnl: 0, signals: [], date: new Date().toLocaleDateString('zh-TW') };
+ 
+// ── 每日績效記錄 ─────────────────────────────────────
+const dailyStats = {
+  wins: 0, losses: 0, totalPnl: 0, signals: [],
+  dailyLoss: 0,           // 今日已虧損（熔斷用）
+  isFused: false,         // 今日熔斷旗標
+  date: new Date().toLocaleDateString('zh-TW'),
+};
 function recordSignal(pair, score, dir) {
   dailyStats.signals.push({ pair, score, dir, time: new Date().toLocaleTimeString('zh-TW') });
 }
-
+function addDailyLoss(amount) {
+  dailyStats.dailyLoss += amount;
+  if (!dailyStats.isFused && dailyStats.dailyLoss >= DAILY_MAX_LOSS) {
+    dailyStats.isFused = true;
+    console.warn(`🔴 每日虧損熔斷觸發！今日虧損 $${dailyStats.dailyLoss.toFixed(2)}，停止交易`);
+    client.pushMessage(USER_ID, {
+      type: 'text',
+      text: `🚨 熔斷警告
+ 
+今日累計虧損已達 $${dailyStats.dailyLoss.toFixed(2)}（上限 $${DAILY_MAX_LOSS}）
+ 
+⛔ 今日剩餘時間停止推送訊號
+明日 08:00 自動重置`,
+    }).catch(()=>{});
+  }
+}
+ 
+// ── BTC 市場情緒緩存 ─────────────────────────────────
+let btcTrend = 'neutral'; // 'bull' | 'bear' | 'neutral'
+let btcTrendUpdatedAt = 0;
+async function updateBtcTrend() {
+  try {
+    const candles = await fetchCandles('BTC-USDT-SWAP', '1H', 25);
+    const ma20 = candles.slice(0, 20).reduce((s, c) => s + c.close, 0) / 20;
+    const price = candles[0].close;
+    const macd  = calcMACD(candles);
+    if (price > ma20 && macd.histogram > 0)       btcTrend = 'bull';
+    else if (price < ma20 && macd.histogram < 0)  btcTrend = 'bear';
+    else                                           btcTrend = 'neutral';
+    btcTrendUpdatedAt = Date.now();
+    console.log(`🪙 BTC趨勢更新：${btcTrend} (價格${price.toFixed(0)} MA20:${ma20.toFixed(0)})`);
+  } catch (e) { console.warn('BTC趨勢更新失敗:', e.message); }
+}
+ 
+// ── 資金費率緩存 ─────────────────────────────────────
+const fundRateCache = new Map(); // instId → { rate, ts }
+async function getFundRate(instId) {
+  const cached = fundRateCache.get(instId);
+  if (cached && Date.now() - cached.ts < 5 * 60 * 1000) return cached.rate;
+  try {
+    const { data } = await axios.get('https://www.okx.com/api/v5/public/funding-rate', {
+      params: { instId }
+    });
+    const rate = parseFloat(data.data[0]?.fundingRate || 0);
+    fundRateCache.set(instId, { rate, ts: Date.now() });
+    return rate;
+  } catch (e) { return 0; }
+}
+ 
+// ── 24h 交易量快取（流動性過濾）───────────────────────
+const volCache = new Map(); // instId → { vol24h, ts }
+async function getVol24h(instId) {
+  const cached = volCache.get(instId);
+  if (cached && Date.now() - cached.ts < 10 * 60 * 1000) return cached.vol24h;
+  try {
+    const { data } = await axios.get('https://www.okx.com/api/v5/market/ticker', {
+      params: { instId }
+    });
+    const vol = parseFloat(data.data[0]?.volCcy24h || 0);
+    volCache.set(instId, { vol24h: vol, ts: Date.now() });
+    return vol;
+  } catch (e) { return Infinity; } // 查不到視為通過
+}
+ 
+// ── ADX 計算（方案E：市況偵測）───────────────────────
+function calcADX(candles, period = 14) {
+  if (candles.length < period + 2) return 25;
+  let plusDM = 0, minusDM = 0, tr = 0;
+  for (let i = 0; i < period; i++) {
+    const c = candles[i], p = candles[i + 1];
+    const upMove   = c.high - p.high;
+    const downMove = p.low  - c.low;
+    plusDM  += upMove   > downMove && upMove   > 0 ? upMove   : 0;
+    minusDM += downMove > upMove   && downMove > 0 ? downMove : 0;
+    tr += Math.max(c.high - c.low, Math.abs(c.high - p.close), Math.abs(c.low - p.close));
+  }
+  const plusDI  = tr > 0 ? 100 * plusDM  / tr : 0;
+  const minusDI = tr > 0 ? 100 * minusDM / tr : 0;
+  const dx = (plusDI + minusDI) > 0 ? 100 * Math.abs(plusDI - minusDI) / (plusDI + minusDI) : 0;
+  return dx; // ADX > 25 = 趨勢，≤25 = 震盪
+}
+ 
+// ── OBV 計算（方案D：量價異動）───────────────────────
+function calcOBV(candles) {
+  let obv = 0;
+  for (let i = candles.length - 1; i > 0; i--) {
+    if (candles[i - 1].close > candles[i].close) obv += candles[i - 1].vol;
+    else if (candles[i - 1].close < candles[i].close) obv -= candles[i - 1].vol;
+  }
+  return obv;
+}
+ 
+// OBV 趨勢：最近 5 根 vs 前 5 根
+function calcOBVTrend(candles) {
+  const recent = calcOBV(candles.slice(0, 5));
+  const prev   = calcOBV(candles.slice(5, 10));
+  return recent > prev ? 'up' : recent < prev ? 'down' : 'flat';
+}
+ 
+// ── RSI 背離偵測（方案D）────────────────────────────
+function detectRSIDivergence(candles) {
+  if (candles.length < 15) return 'none';
+  const prices = candles.slice(0, 10).map(c => c.close);
+  const rsiArr = candles.slice(0, 10).map((_, i) => calcRSI(candles.slice(i)));
+  const priceDown = prices[0] < prices[4];  // 近期價格創低
+  const rsiUp     = rsiArr[0] > rsiArr[4];  // RSI 未創低（底背離）
+  const priceUp   = prices[0] > prices[4];  // 近期價格創高
+  const rsiDown   = rsiArr[0] < rsiArr[4];  // RSI 未創高（頂背離）
+  if (priceDown && rsiUp)   return 'bullish';  // 底背離 → 做多
+  if (priceUp   && rsiDown) return 'bearish';  // 頂背離 → 做空
+  return 'none';
+}
+ 
+// ── ATR 動態倍數（方案E）────────────────────────────
+function getATRMultiplier(atr, candles) {
+  const avgATR = candles.slice(0, 20).reduce((s, c) => {
+    const p = candles[candles.indexOf(c) + 1];
+    if (!p) return s;
+    return s + Math.max(c.high - c.low, Math.abs(c.high - p.close), Math.abs(c.low - p.close));
+  }, 0) / 20;
+  if (atr < avgATR * 0.7) return 1.2;   // 低波動：止損緊一點
+  if (atr > avgATR * 1.5) return 2.0;   // 高波動：止損寬一點
+  return 1.5;                            // 正常
+}
+ 
+// ── 多時框分析（方案C）───────────────────────────────
+async function analyzeMultiTimeframe(instId) {
+  try {
+    const [c4h, c1h] = await Promise.all([
+      fetchCandles(instId, '4H', 30),
+      fetchCandles(instId, '1H', 30),
+    ]);
+    const ma20_4h  = c4h.slice(0, 20).reduce((s, c) => s + c.close, 0) / 20;
+    const macd4h   = calcMACD(c4h);
+    const ma20_1h  = c1h.slice(0, 20).reduce((s, c) => s + c.close, 0) / 20;
+    const rsi1h    = calcRSI(c1h);
+    const macd1h   = calcMACD(c1h);
+ 
+    const bull4h = c4h[0].close > ma20_4h && macd4h.histogram > 0;
+    const bear4h = c4h[0].close < ma20_4h && macd4h.histogram < 0;
+    // 1H 回調到 MA 附近
+    const pullback1h = Math.abs(c1h[0].close - ma20_1h) / ma20_1h < 0.008;
+    // 1H 反彈確認
+    const bounce1h_long  = rsi1h > 45 && macd1h.histogram > 0 && pullback1h;
+    const bounce1h_short = rsi1h < 55 && macd1h.histogram < 0 && pullback1h;
+ 
+    let mtfDir = 'neutral', mtfBonus = 0;
+    if (bull4h && bounce1h_long)  { mtfDir = 'long';  mtfBonus = 15; }
+    if (bear4h && bounce1h_short) { mtfDir = 'short'; mtfBonus = 15; }
+    return { mtfDir, mtfBonus };
+  } catch (e) {
+    return { mtfDir: 'neutral', mtfBonus: 0 };
+  }
+}
+ 
 // ══════════════════════════════════════════════
 // 1. 動態抓取交易量前10名幣對
 // ══════════════════════════════════════════════
@@ -93,10 +254,11 @@ async function updateTopPairs() {
     const top10 = data.data
       .filter(t => t.instId.endsWith('-USDT-SWAP'))
       .filter(t => !stableCoins.some(s => t.instId.startsWith(s)))
+      .filter(t => parseFloat(t.volCcy24h) >= MIN_VOL_USDT) // 流動性過濾
       .sort((a, b) => parseFloat(b.volCcy24h) - parseFloat(a.volCcy24h))
       .slice(0, 10)
-      .map(t => t.instId);  // already SWAP format
-
+      .map(t => t.instId);
+ 
     const merged = [...new Set([...FIXED_PAIRS, ...top10])];
     WATCH_PAIRS = merged;
     console.log(`📊 監控幣對更新：${WATCH_PAIRS.join(', ')}`);
@@ -104,7 +266,7 @@ async function updateTopPairs() {
     console.error('更新幣對失敗:', e.message);
   }
 }
-
+ 
 // ══════════════════════════════════════════════
 // 2. 行情抓取
 // ══════════════════════════════════════════════
@@ -118,18 +280,18 @@ async function fetchCandles(instId, bar = '4H', limit = 50) {
     low: parseFloat(c[3]),  close: parseFloat(c[4]), vol: parseFloat(c[5]),
   }));
 }
-
+ 
 async function fetchCandles5m(instId) {
   return fetchCandles(instId, '5m', 20);
 }
-
+ 
 async function fetchTicker(instId) {
   const { data } = await axios.get('https://www.okx.com/api/v5/market/ticker', {
     params: { instId }
   });
   return data.data[0];
 }
-
+ 
 // ══════════════════════════════════════════════
 // 3. 技術指標計算
 // ══════════════════════════════════════════════
@@ -146,7 +308,7 @@ function calcRSI(candles, period = 14) {
   const rs = avgGain / avgLoss;
   return 100 - (100 / (1 + rs));
 }
-
+ 
 function calcMACD(candles) {
   const closes = candles.map(c => c.close).reverse();
   const ema = (data, period) => {
@@ -161,7 +323,7 @@ function calcMACD(candles) {
   const signal = ema(closes.slice(-9), 9);
   return { macd: macdLine, signal, histogram: macdLine - signal };
 }
-
+ 
 function calcATR(candles, period = 14) {
   const trs = [];
   for (let i = 0; i < Math.min(period, candles.length - 1); i++) {
@@ -170,14 +332,14 @@ function calcATR(candles, period = 14) {
   }
   return trs.reduce((a, b) => a + b, 0) / trs.length;
 }
-
+ 
 function calcBollinger(candles, period = 20) {
   const closes = candles.slice(0, period).map(c => c.close);
   const avg = closes.reduce((a, b) => a + b, 0) / period;
   const std = Math.sqrt(closes.reduce((a, b) => a + Math.pow(b - avg, 2), 0) / period);
   return { upper: avg + 2 * std, middle: avg, lower: avg - 2 * std };
 }
-
+ 
 function calc5mFlow(candles5m) {
   const recent = candles5m.slice(0, 5);
   const bullVol = recent.filter(c => c.close > c.open).reduce((s, c) => s + c.vol, 0);
@@ -189,7 +351,7 @@ function calc5mFlow(candles5m) {
   const volSurge = prevAvg > 0 ? avgVol / prevAvg : 1;
   return { bullRatio, bearRatio: 1 - bullRatio, volSurge, avgVol };
 }
-
+ 
 // ══════════════════════════════════════════════
 // 4. 市場輿情（CryptoPanic + Fear & Greed）
 // ══════════════════════════════════════════════
@@ -198,7 +360,7 @@ async function fetchSentiment(coinSymbol) {
     const fgRes = await axios.get('https://api.alternative.me/fng/?limit=1');
     const fgValue = parseInt(fgRes.data.data[0].value);
     const fgLabel = fgRes.data.data[0].value_classification;
-
+ 
     let newsScore = 0;
     let newsItems = [];
     try {
@@ -211,130 +373,267 @@ async function fetchSentiment(coinSymbol) {
         newsItems.push(p.title?.slice(0, 40) + '…');
       }
     } catch (_) {}
-
+ 
     return { fgValue, fgLabel, newsScore, newsItems };
   } catch (e) {
     return { fgValue: 50, fgLabel: 'Neutral', newsScore: 0, newsItems: [] };
   }
 }
-
+ 
 // ══════════════════════════════════════════════
 // 5. 綜合分析
 // ══════════════════════════════════════════════
 async function analyze(instId) {
-  const [candles, candles5m, ticker] = await Promise.all([
+  const [candles, candles5m, ticker, mtf] = await Promise.all([
     fetchCandles(instId),
     fetchCandles5m(instId),
     fetchTicker(instId).catch(() => null),
+    analyzeMultiTimeframe(instId),   // 方案C：多時框
   ]);
   const currentPrice = ticker ? parseFloat(ticker.last) : null;
-
+ 
   const last  = candles[0];
   const prev5 = candles.slice(1, 6);
-
+ 
   const resistance = Math.max(...prev5.map(c => c.high));
   const support    = Math.min(...prev5.map(c => c.low));
   const avgVol     = prev5.reduce((s, c) => s + c.vol, 0) / prev5.length;
   const volRatio   = last.vol / avgVol;
   const ma10       = candles.slice(0, 10).reduce((s, c) => s + c.close, 0) / 10;
   const ma20       = candles.slice(0, 20).reduce((s, c) => s + c.close, 0) / 20;
-
+ 
   const rsi    = calcRSI(candles);
   const macd   = calcMACD(candles);
   const atr    = calcATR(candles);
   const boll   = calcBollinger(candles);
-  const flow5m = calc5mFlow(candles5m);
-
+  const flow5m   = calc5mFlow(candles5m);
+  const adx      = calcADX(candles);              // 方案E：市況偵測
+  const obvTrend = calcOBVTrend(candles);         // 方案D：量價異動
+  const rsiDiv   = detectRSIDivergence(candles);  // 方案D：RSI背離
+  const isTrend  = adx > 25;                      // 方案E：趨勢 or 震盪模式
+ 
   const reasons = [];
   let score = 50, dir = 'neutral';
-
-  // 突破阻力
-  if (last.close > resistance && volRatio > 1.2) {
-    reasons.push({ t: `突破${resistance.toFixed(3)}阻力`, ok: true });
-    score += 18; dir = 'long';
-  }
-  // 跌破支撐
-  if (last.close < support && volRatio > 1.2) {
-    reasons.push({ t: `跌破${support.toFixed(3)}支撐`, ok: true });
-    score += 15; dir = 'short';
-  }
-  // 回測支撐
-  if (dir === 'neutral' && last.close < support * 1.005 && last.close > support * 0.995) {
-    reasons.push({ t: `回測${support.toFixed(3)}支撐`, ok: true });
-    score += 12; dir = 'long';
-  }
-  // RSI
-  if (rsi < 35 && dir !== 'short') {
-    reasons.push({ t: `RSI超賣(${rsi.toFixed(0)})`, ok: true }); score += 10;
-    if (dir === 'neutral') dir = 'long';
-  } else if (rsi > 65 && dir !== 'long') {
-    reasons.push({ t: `RSI超買(${rsi.toFixed(0)})`, ok: true }); score += 8;
-    if (dir === 'neutral') dir = 'short';
+ 
+  const ma50         = candles.slice(-50).reduce((s,c)=>s+c.close,0)/50;
+  const isCandle_bull = last.close > last.open;
+  const candleBody    = Math.abs(last.close - last.open);
+  const candleRange   = last.high - last.low;
+  const bodyRatio     = candleRange > 0 ? candleBody / candleRange : 0;
+ 
+  // ── 方向預判（多空信號各自計分）────────────────
+  let longPts = 0, shortPts = 0;
+  if (last.close > resistance && volRatio > 1.2)           longPts  += 4;
+  if (last.close < support    && volRatio > 1.2)           shortPts += 4;
+  if (last.close < support * 1.005 && last.close > support * 0.995) longPts += 2;
+  if (rsi < 40)  longPts  += 3;
+  if (rsi > 60)  shortPts += 3;
+  if (macd.histogram > 0 && macd.macd > macd.signal)      longPts  += 2;
+  if (macd.histogram < 0 && macd.macd < macd.signal)      shortPts += 2;
+  if (ma10 > ma20 && ma20 > ma50)                          longPts  += 2;
+  if (ma10 < ma20 && ma20 < ma50)                          shortPts += 2;
+  if (flow5m.bullRatio > 0.6)                              longPts  += 2;
+  if (flow5m.bullRatio < 0.4)                              shortPts += 2;
+  if (isCandle_bull && bodyRatio > 0.5)                    longPts  += 1;
+  if (!isCandle_bull && bodyRatio > 0.5)                   shortPts += 1;
+  if (last.close > boll.upper)                             longPts  += 1;
+  if (last.close < boll.lower)                             shortPts += 1;
+ 
+  if      (longPts  >= shortPts + 3) dir = 'long';
+  else if (shortPts >= longPts  + 3) dir = 'short';
+ 
+  // ══════════════════════════════════════════════
+  // 做多獨立評分
+  // ══════════════════════════════════════════════
+  if (dir === 'long') {
+    // 突破阻力
+    if (last.close > resistance && volRatio > 1.2) {
+      reasons.push({ t: `突破${fmt(resistance)}阻力`, ok: true }); score += 18;
+    }
+    // 支撐回測
+    if (last.close < support * 1.005 && last.close > support * 0.995) {
+      reasons.push({ t: `回測${fmt(support)}支撐`, ok: true }); score += 12;
+    }
+    // RSI
+    if (rsi < 35) {
+      reasons.push({ t: `RSI超賣(${rsi.toFixed(0)})`, ok: true }); score += 14;
+    } else if (rsi < 50) {
+      reasons.push({ t: `RSI健康(${rsi.toFixed(0)})`, ok: true }); score += 6;
+    } else if (rsi > 70) {
+      reasons.push({ t: `RSI過熱(${rsi.toFixed(0)})`, ok: false }); score -= 8;
+    } else {
+      reasons.push({ t: `RSI中性(${rsi.toFixed(0)})`, ok: false }); score -= 3;
+    }
+    // MACD
+    if (macd.histogram > 0 && macd.macd > macd.signal) {
+      reasons.push({ t: 'MACD金叉', ok: true }); score += 10;
+    } else {
+      reasons.push({ t: 'MACD未金叉', ok: false }); score -= 6;
+    }
+    // 布林
+    if (last.close > boll.upper) {
+      reasons.push({ t: '突破布林上軌', ok: true }); score += 8;
+    }
+    // MA 多頭排列
+    if (ma10 > ma20) {
+      reasons.push({ t: 'MA10>MA20多頭', ok: true }); score += 8;
+      if (ma20 > ma50) { reasons.push({ t: 'MA均線多頭排列', ok: true }); score += 5; }
+    } else {
+      reasons.push({ t: 'MA均線空頭', ok: false }); score -= 7;
+    }
+    // 5m資金流
+    if (flow5m.bullRatio > 0.65) {
+      reasons.push({ t: `5m買方${(flow5m.bullRatio*100).toFixed(0)}%`, ok: true }); score += 7;
+    } else if (flow5m.bullRatio < 0.4) {
+      reasons.push({ t: '5m賣方壓制', ok: false }); score -= 6;
+    }
+    // 量能
+    if (volRatio > 1.5) {
+      reasons.push({ t: `放量${volRatio.toFixed(1)}x`, ok: true }); score += 7;
+    } else if (volRatio < 0.7) {
+      reasons.push({ t: '量能萎縮', ok: false }); score -= 5;
+    }
+    // K線
+    if (isCandle_bull && bodyRatio > 0.5) {
+      reasons.push({ t: '強力陽線', ok: true }); score += 5;
+    } else if (!isCandle_bull) {
+      reasons.push({ t: '收陰線', ok: false }); score -= 5;
+    }
+    // 方案C：多時框共振
+    if (mtf.mtfDir === 'long') {
+      reasons.push({ t: '4H+1H共振做多', ok: true }); score += mtf.mtfBonus;
+    }
+    // 方案D：OBV量價 + RSI背離
+    if (obvTrend === 'up') {
+      reasons.push({ t: 'OBV量能上升', ok: true }); score += 8;
+    }
+    if (rsiDiv === 'bullish') {
+      reasons.push({ t: 'RSI底背離', ok: true }); score += 10;
+    }
+    // 方案E：自適應 — 趨勢模式加重動量，震盪模式加重均值回歸
+    if (isTrend) {
+      if (ma10 > ma20 && macd.histogram > 0) { score += 5; } // 趨勢模式：動量加權
+    } else {
+      if (rsi < 35) { score += 6; } // 震盪模式：超賣更有效
+    }
+ 
+  // ══════════════════════════════════════════════
+  // 做空獨立評分（與做多完全對稱優化）
+  // ══════════════════════════════════════════════
+  } else if (dir === 'short') {
+    // 跌破支撐
+    if (last.close < support && volRatio > 1.2) {
+      reasons.push({ t: `跌破${fmt(support)}支撐`, ok: true }); score += 18;
+    }
+    // RSI
+    if (rsi > 65) {
+      reasons.push({ t: `RSI超買(${rsi.toFixed(0)})`, ok: true }); score += 14;
+    } else if (rsi > 50) {
+      reasons.push({ t: `RSI偏高(${rsi.toFixed(0)})`, ok: true }); score += 6;
+    } else if (rsi < 30) {
+      reasons.push({ t: `RSI過低(${rsi.toFixed(0)})`, ok: false }); score -= 8;
+    } else {
+      reasons.push({ t: `RSI中性(${rsi.toFixed(0)})`, ok: false }); score -= 3;
+    }
+    // MACD 死叉
+    if (macd.histogram < 0 && macd.macd < macd.signal) {
+      reasons.push({ t: 'MACD死叉', ok: true }); score += 10;
+    } else {
+      reasons.push({ t: 'MACD未死叉', ok: false }); score -= 6;
+    }
+    // 布林
+    if (last.close < boll.lower) {
+      reasons.push({ t: '跌破布林下軌', ok: true }); score += 8;
+    }
+    // MA 空頭排列
+    if (ma10 < ma20) {
+      reasons.push({ t: 'MA10<MA20空頭', ok: true }); score += 8;
+      if (ma20 < ma50) { reasons.push({ t: 'MA均線空頭排列', ok: true }); score += 5; }
+    } else {
+      reasons.push({ t: 'MA均線多頭', ok: false }); score -= 7;
+    }
+    // 5m資金流（賣方主導是利多）
+    if (flow5m.bullRatio < 0.35) {
+      reasons.push({ t: `5m賣方${((1-flow5m.bullRatio)*100).toFixed(0)}%`, ok: true }); score += 7;
+    } else if (flow5m.bullRatio > 0.6) {
+      reasons.push({ t: '5m買方壓制', ok: false }); score -= 6;
+    }
+    // 量能（放量下跌是利多）
+    if (volRatio > 1.5) {
+      reasons.push({ t: `放量下跌${volRatio.toFixed(1)}x`, ok: true }); score += 7;
+    } else if (volRatio < 0.7) {
+      reasons.push({ t: '量能萎縮', ok: false }); score -= 5;
+    }
+    // K線（強力陰線是利多）
+    if (!isCandle_bull && bodyRatio > 0.5) {
+      reasons.push({ t: '強力陰線', ok: true }); score += 5;
+    } else if (isCandle_bull) {
+      reasons.push({ t: '收陽線', ok: false }); score -= 5;
+    }
+    // 方案C：多時框共振
+    if (mtf.mtfDir === 'short') {
+      reasons.push({ t: '4H+1H共振做空', ok: true }); score += mtf.mtfBonus;
+    }
+    // 方案D：OBV量價 + RSI背離
+    if (obvTrend === 'down') {
+      reasons.push({ t: 'OBV量能下降', ok: true }); score += 8;
+    }
+    if (rsiDiv === 'bearish') {
+      reasons.push({ t: 'RSI頂背離', ok: true }); score += 10;
+    }
+    // 方案E：自適應
+    if (isTrend) {
+      if (ma10 < ma20 && macd.histogram < 0) { score += 5; }
+    } else {
+      if (rsi > 65) { score += 6; }
+    }
+ 
+  // ── 中性（條件不足）──────────────────────────
   } else {
-    reasons.push({ t: `RSI中性(${rsi.toFixed(0)})`, ok: false }); score -= 3;
+    reasons.push({ t: `RSI中性(${rsi.toFixed(0)})`, ok: false });
+    reasons.push({ t: 'MACD方向不明', ok: false });
+    score = 35;
   }
-  // MACD
-  if (macd.histogram > 0 && macd.macd > macd.signal) {
-    reasons.push({ t: 'MACD金叉', ok: true }); score += 8;
-  } else if (macd.histogram < 0 && macd.macd < macd.signal) {
-    reasons.push({ t: 'MACD死叉', ok: false }); score -= 5;
-  }
-  // 布林通道
-  if (last.close > boll.upper) {
-    reasons.push({ t: '突破布林上軌', ok: dir === 'long' }); score += dir === 'long' ? 6 : -4;
-  } else if (last.close < boll.lower) {
-    reasons.push({ t: '跌破布林下軌', ok: dir === 'short' }); score += dir === 'short' ? 6 : -4;
-  }
-  // 成交量
-  if (volRatio > 1.5) {
-    reasons.push({ t: `量放大${volRatio.toFixed(1)}x`, ok: true }); score += 8;
-  } else if (volRatio < 0.7) {
-    reasons.push({ t: '量萎縮', ok: false }); score -= 6;
-  }
-  // MA
-  if (last.close > ma10 && ma10 > ma20) {
-    reasons.push({ t: 'MA10>MA20多頭', ok: true }); score += 6;
-  } else if (last.close < ma10 && ma10 < ma20) {
-    reasons.push({ t: 'MA10<MA20空頭', ok: false }); score -= 4;
-  }
-  // 5分鐘資金流
-  if (flow5m.bullRatio > 0.65) {
-    reasons.push({ t: `5m買方${(flow5m.bullRatio*100).toFixed(0)}%`, ok: true }); score += 5;
-  } else if (flow5m.bullRatio < 0.35) {
-    reasons.push({ t: `5m賣方${((1-flow5m.bullRatio)*100).toFixed(0)}%`, ok: false }); score -= 4;
-  }
-  // K線方向
-  if (last.close > last.open) {
-    reasons.push({ t: '收陽線', ok: true }); score += 4;
-  } else {
-    reasons.push({ t: '收陰線', ok: false }); score -= 3;
-  }
-
+ 
   score = Math.min(100, Math.max(0, score));
   const entry = last.close;
-
-  // ATR 動態止損
-  const atrSL = atr * 1.5;
+ 
+  // 方案E：ATR 動態倍數（低波動緊、高波動寬）
+  const atrMult = getATRMultiplier(atr, candles);
+  const atrSL = atr * atrMult;
   const sl = dir === 'long' ? entry - atrSL : entry + atrSL;
   const slDist = Math.abs(entry - sl);
-
+ 
   // 止盈分3等分
   const tp1 = dir === 'long' ? entry + slDist : entry - slDist;         // 1:1
   const tp2 = dir === 'long' ? entry + slDist * 1.8 : entry - slDist * 1.8; // 1:1.8
   const tp3 = dir === 'long' ? entry + slDist * 3.0 : entry - slDist * 3.0; // 1:3
-
+ 
   // 動態槓桿評估
   let leverage = 5;
-  if (flow5m.volSurge > 2 && flow5m.bullRatio > 0.6 && score >= 75) leverage = 20;
-  else if (flow5m.volSurge > 1.5 && score >= 70) leverage = 15;
-  else if (score >= 65) leverage = 10;
-  else leverage = 5;
-
+  if (dir === 'long') {
+    if (flow5m.volSurge > 2 && flow5m.bullRatio > 0.6 && score >= 75) leverage = 20;
+    else if (flow5m.volSurge > 1.5 && score >= 70) leverage = 15;
+    else if (score >= 65) leverage = 10;
+    else leverage = 5;
+  } else if (dir === 'short') {
+    if (flow5m.volSurge > 2 && flow5m.bullRatio < 0.35 && score >= 75) leverage = 20;
+    else if (flow5m.volSurge > 1.5 && score >= 70) leverage = 15;
+    else if (score >= 65) leverage = 10;
+    else leverage = 5;
+  }
+ 
   // 是否加倍本金
-  const doubleCapital = flow5m.volSurge > 2.5 && score >= 80;
-
-  // 風控計算
-  const capital = doubleCapital ? BASE_CAPITAL * 2 : BASE_CAPITAL;
+  const doubleCapital = flow5m.volSurge > 2.5 && score >= 80 && (
+    (dir === 'long'  && flow5m.bullRatio > 0.65) ||
+    (dir === 'short' && flow5m.bullRatio < 0.35)
+  );
+ 
+  // 方案E：Kelly 動態本金（依評分調整）
+  let kellyMult = 1.0;
+  if (score >= 90) kellyMult = 2.0;
+  else if (score >= 80) kellyMult = 1.5;
+  const capital = BASE_CAPITAL * kellyMult * (doubleCapital ? 1.5 : 1);
   const slPct = slDist / entry;
   const maxLossByPct = capital * MAX_LOSS_PCT;
   const effectiveMaxLoss = Math.min(MAX_LOSS_USDT, maxLossByPct);
@@ -347,31 +646,32 @@ async function analyze(instId) {
   const tp2Amount = (positionSize * (slDist * 1.8 / entry)).toFixed(2);
   const tp3Amount = (positionSize * (slDist * 3 / entry)).toFixed(2);
   const fee = (positionSize * 0.0005).toFixed(2);
-
+ 
   // 合約張數估算（以 1 USDT/張 粗估，實際依幣種合約面值）
   const swapSz = Math.max(1, Math.floor(positionSize / entry));
-
+ 
   return {
     score, dir, reasons, entry, sl, tp1, tp2, tp3,
-    rr: '1:1.8', atr, leverage: finalLeverage,
+    rr: '1:1.8', atr, atrMult, leverage: finalLeverage,
     capital, positionSize: positionSize.toFixed(2),
     slAmount, tp1Amount, tp2Amount, tp3Amount, fee,
     doubleCapital, flow5m, rsi, macd, swapSz,
-    currentPrice: currentPrice || entry,  // 即時價格
+    currentPrice: currentPrice || entry,
+    adx, isTrend, mtfDir: mtf.mtfDir, obvTrend, rsiDiv, // 新指標
   };
 }
-
-
+ 
+ 
 // ══════════════════════════════════════════════
 // OKX 合約下單（簽名 + API）
 // ══════════════════════════════════════════════
 const crypto = require('crypto');
-
+ 
 function okxSign(timestamp, method, path, body = '') {
   const msg = timestamp + method + path + body;
   return crypto.createHmac('sha256', OKX_SECRET).update(msg).digest('base64');
 }
-
+ 
 function okxHeaders(method, path, body = '') {
   const ts = new Date().toISOString().replace(/\.\d{3}Z$/, '.000Z');
   return {
@@ -383,7 +683,7 @@ function okxHeaders(method, path, body = '') {
     ...(IS_DEMO ? { 'x-simulated-trading': '1' } : {}),
   };
 }
-
+ 
 async function okxPost(path, body) {
   const bodyStr = JSON.stringify(body);
   const { data } = await axios.post(
@@ -392,7 +692,7 @@ async function okxPost(path, body) {
   );
   return data;
 }
-
+ 
 async function setLeverage(instId, lever) {
   try {
     await okxPost('/api/v5/account/set-leverage', {
@@ -401,17 +701,17 @@ async function setLeverage(instId, lever) {
     console.log(`⚡ 槓桿設定 ${instId} ${lever}x`);
   } catch (e) { console.warn('槓桿設定失敗:', e.message); }
 }
-
+ 
 async function placeSwapOrder(instId, a) {
   if (!OKX_API_KEY) return '⚠️ 未設定 OKX API Key，請在 Render Environment 加入。';
   const isLong  = a.dir === 'long';
   const posSide = isLong ? 'long' : 'short';
   const side    = isLong ? 'buy'  : 'sell';
   const closeSide = isLong ? 'sell' : 'buy';
-
+ 
   try {
     await setLeverage(instId, a.leverage);
-
+ 
     // 市價開倉
     const orderRes = await okxPost('/api/v5/trade/order', {
       instId, tdMode: MGN_MODE, side, posSide,
@@ -419,17 +719,17 @@ async function placeSwapOrder(instId, a) {
     });
     if (orderRes.code !== '0') return `❌ 開倉失敗：${orderRes.msg}`;
     const ordId = orderRes.data[0].ordId;
-
+ 
     // 等成交
     await new Promise(r => setTimeout(r, 1500));
-
+ 
     // 止損
     await okxPost('/api/v5/trade/order-algo', {
       instId, tdMode: MGN_MODE, side: closeSide, posSide,
       ordType: 'conditional', sz: String(a.swapSz || 1),
       slTriggerPx: a.sl.toFixed(Math.max(6, getDecimals(a.sl))), slOrdPx: '-1',
     });
-
+ 
     // 三等分止盈（每筆 1/3 張數，最少1）
     const szEach = String(Math.max(1, Math.floor((a.swapSz || 1) / 3)));
     for (const tp of [a.tp1, a.tp2, a.tp3]) {
@@ -439,15 +739,15 @@ async function placeSwapOrder(instId, a) {
         tpTriggerPx: tp.toFixed(Math.max(6, getDecimals(tp))), tpOrdPx: '-1',
       });
     }
-
+ 
     return `✅ 合約下單成功！\n訂單ID：${ordId}\n止損/三等分止盈已掛單`;
   } catch (e) {
     console.error('下單錯誤:', e.message);
     return `❌ 下單失敗：${e.message}`;
   }
 }
-
-
+ 
+ 
 // ══════════════════════════════════════════════
 // 方案D：每日報告 Flex Message
 // ══════════════════════════════════════════════
@@ -459,7 +759,7 @@ function buildDailyReport() {
   const longCount  = dailyStats.signals.filter(s => s.dir === 'long').length;
   const shortCount = dailyStats.signals.filter(s => s.dir === 'short').length;
   const avgScore   = total > 0 ? Math.round(dailyStats.signals.reduce((s, x) => s + x.score, 0) / total) : 0;
-
+ 
   const signalRows = topPairs.map(s => ({
     type: 'box', layout: 'horizontal', paddingAll: '6px',
     backgroundColor: '#0d1520', cornerRadius: '5px', margin: 'xs',
@@ -470,7 +770,7 @@ function buildDailyReport() {
       { type: 'text', text: s.time, color: '#6b7a99', size: 'xxs', flex: 2, align: 'end' },
     ]
   }));
-
+ 
   return {
     type: 'flex',
     altText: `📊 每日報告 ${dailyStats.date}`,
@@ -523,7 +823,7 @@ function buildDailyReport() {
     }
   };
 }
-
+ 
 // ══════════════════════════════════════════════
 // 6. LINE 訊號卡
 // ══════════════════════════════════════════════
@@ -537,13 +837,13 @@ function buildSignalCard(pair, a, signalLevel = 'strong') {
   const emoji     = isStrong ? '🔴' : '🟡';
   const now       = new Date().toLocaleTimeString('zh-TW', { hour: '2-digit', minute: '2-digit' });
   const displayPair = pair.replace(/-SWAP$/, '').replace(/-/g, '/');
-
+ 
   // 當下即時價格（分析時抓到的 entry 就是最新成交價）
   const currentPrice = a.currentPrice || a.entry;
   const priceDiff    = currentPrice - a.entry;
   const priceDiffStr = priceDiff >= 0 ? `+${priceDiff.toFixed(4)}` : priceDiff.toFixed(4);
   const priceColor   = priceDiff >= 0 ? '#4ade80' : '#f87171';
-
+ 
   return {
     type: 'flex',
     altText: `${emoji} ${displayPair} ${isLong?'做多':'做空'} 評分${a.score} 現價${fmt(currentPrice)}`,
@@ -576,7 +876,7 @@ function buildSignalCard(pair, a, signalLevel = 'strong') {
             { type: 'text', text: displayPair, color: '#e8eaf0', size: 'xl', weight: 'bold', flex: 1 },
             { type: 'text', text: isLong ? '做多 📈' : '做空 📉', color: isLong ? '#4ade80' : '#f87171', size: 'sm', align: 'end', gravity: 'center' },
           ]},
-
+ 
           // ── 當下即時價格區塊（新增）──────────────────
           { type: 'box', layout: 'horizontal', backgroundColor: '#0d1520', cornerRadius: '6px', paddingAll: '8px', margin: 'sm', contents: [
             { type: 'box', layout: 'vertical', flex: 1, contents: [
@@ -586,12 +886,12 @@ function buildSignalCard(pair, a, signalLevel = 'strong') {
             { type: 'box', layout: 'vertical', alignItems: 'flex-end', contents: [
               { type: 'text', text: '較訊號價', color: '#6b7a99', size: 'xxs' },
               { type: 'text', text: priceDiffStr, color: priceColor, size: 'sm', weight: 'bold' },
-              { type: 'text', text: `RSI ${a.rsi?.toFixed(0)}  ${a.doubleCapital ? '⚡加倍' : ''}`, color: '#6b7a99', size: 'xxs' },
+              { type: 'text', text: `RSI ${a.rsi?.toFixed(0)} ADX ${a.adx?.toFixed(0)||'—'} ${a.isTrend?'趨勢':'震盪'} ${a.doubleCapital?'⚡':''}`, color: '#6b7a99', size: 'xxs' },
             ]},
           ]},
-
+ 
           { type: 'separator', color: '#ffffff12' },
-
+ 
           // 進場 + 槓桿
           { type: 'box', layout: 'baseline', spacing: 'sm', contents: [
             { type: 'text', text: '訊號價', color: '#6b7a99', size: 'xs', flex: 1 },
@@ -607,7 +907,7 @@ function buildSignalCard(pair, a, signalLevel = 'strong') {
             { type: 'text', text: `-$${a.slAmount}`, color: '#f87171', size: 'sm', weight: 'bold', flex: 2 },
           ]},
           { type: 'separator', color: '#ffffff12' },
-
+ 
           // 止盈三等分
           { type: 'text', text: '🎯 止盈三等分', color: '#4ade80', size: 'xs', weight: 'bold' },
           { type: 'box', layout: 'baseline', spacing: 'sm', contents: [
@@ -626,12 +926,17 @@ function buildSignalCard(pair, a, signalLevel = 'strong') {
             { type: 'text', text: `+$${a.tp3Amount}`, color: '#4ade80', size: 'xs', flex: 2 },
           ]},
           { type: 'separator', color: '#ffffff12' },
-
+ 
           // 信號條件
           { type: 'text', text: a.reasons.filter(r => r.ok).map(r => `✅ ${r.t}`).join('  '), color: '#4ade80', size: 'xxs', wrap: true },
           { type: 'text', text: a.reasons.filter(r => !r.ok).map(r => `❌ ${r.t}`).join('  '), color: '#f87171', size: 'xxs', wrap: true },
+          { type: 'text', text: [
+            a.mtfDir !== 'neutral' ? `📡 MTF共振${a.mtfDir==='long'?'多':'空'}` : '',
+            a.obvTrend === 'up' ? '📈 OBV↑' : a.obvTrend === 'down' ? '📉 OBV↓' : '',
+            a.rsiDiv !== 'none' ? (a.rsiDiv==='bullish'?'🔔RSI底背離':'🔔RSI頂背離') : '',
+          ].filter(Boolean).join('  ') || '—', color: '#00cfff', size: 'xxs', wrap: true },
           { type: 'separator', color: '#ffffff12' },
-
+ 
           // 費用
           { type: 'box', layout: 'baseline', spacing: 'sm', contents: [
             { type: 'text', text: '本金', color: '#6b7a99', size: 'xs', flex: 1 },
@@ -655,54 +960,90 @@ function buildSignalCard(pair, a, signalLevel = 'strong') {
     },
   };
 }
-
+ 
 // ══════════════════════════════════════════════
 // 7. 掃描推送
 // ══════════════════════════════════════════════
 async function scanAndPush() {
-  console.log(`[${new Date().toLocaleTimeString()}] 掃描 ${WATCH_PAIRS.length} 個幣對…`);
-
-  // ── 方案A：並行分析所有幣對（速度提升 3-5x）────────
+  // ── Phase1：每日熔斷檢查 ─────────────────────────
+  if (dailyStats.isFused) {
+    console.log('⛔ 今日已熔斷，跳過掃描');
+    return;
+  }
+ 
+  // ── Phase1：BTC 市場情緒更新（每10分鐘）──────────
+  if (Date.now() - btcTrendUpdatedAt > 10 * 60 * 1000) {
+    await updateBtcTrend();
+  }
+ 
+  console.log(`[${new Date().toLocaleTimeString()}] 掃描 ${WATCH_PAIRS.length} 個幣對… BTC趨勢:${btcTrend}`);
+ 
+  // ── 方案A：並行分析（速度提升 3-5x）────────────────
   const results = await Promise.allSettled(
     WATCH_PAIRS.map(pair => analyze(pair).then(a => ({ pair, a })))
   );
-
+ 
   for (const res of results) {
     if (res.status === 'rejected') { console.error('❌ 分析失敗:', res.reason?.message); continue; }
     const { pair, a } = res.value;
     try {
       if (a.dir === 'neutral') continue;
-
-      // ── 方案B：冷卻機制 ──────────────────────────
+ 
+      // ── Phase1：流動性過濾 ─────────────────────────
+      const vol24h = await getVol24h(pair);
+      if (vol24h < MIN_VOL_USDT) {
+        console.log(`💧 ${pair} 流動性不足(${(vol24h/1e6).toFixed(1)}M)，跳過`);
+        continue;
+      }
+ 
+      // ── Phase1：BTC 情緒過濾 ──────────────────────
+      if (a.dir === 'long' && btcTrend === 'bear') {
+        console.log(`🐻 BTC空頭環境，跳過 ${pair} 做多`);
+        continue;
+      }
+      if (a.dir === 'short' && btcTrend === 'bull') {
+        console.log(`🐂 BTC多頭環境，跳過 ${pair} 做空`);
+        continue;
+      }
+ 
+      // ── Phase2：資金費率過濾 ──────────────────────
+      const fundRate = await getFundRate(pair);
+      if (a.dir === 'long'  && fundRate >  FUND_RATE_LIMIT) {
+        console.log(`💸 ${pair} 資金費率過高(${(fundRate*100).toFixed(4)}%)，跳過做多`);
+        continue;
+      }
+      if (a.dir === 'short' && fundRate < -FUND_RATE_LIMIT) {
+        console.log(`💸 ${pair} 資金費率過負(${(fundRate*100).toFixed(4)}%)，跳過做空`);
+        continue;
+      }
+ 
+      // ── 方案B：冷卻機制 ───────────────────────────
       if (isOnCooldown(pair)) {
         console.log(`⏸ ${pair} 冷卻中，跳過`);
         continue;
       }
-
-      // ── 方案C：訊號強度分級 ──────────────────────
+ 
+      // ── 方案C：訊號強度分級推送 ───────────────────
       if (a.score >= 80) {
-        // 🔴 強訊號 → 立即推送（正常訊號卡）
         await client.pushMessage(USER_ID, buildSignalCard(pair, a, 'strong'));
         pendingOrders[pair] = { pair, analysis: a };
         setCooldown(pair);
         recordSignal(pair, a.score, a.dir);
-        console.log(`🔴 強訊號推送：${pair} 評分${a.score}`);
+        console.log(`🔴 強訊號推送：${pair} 評分${a.score} ADX${a.adx?.toFixed(0)} MTF:${a.mtfDir}`);
       } else if (a.score >= MIN_SCORE) {
-        // 🟡 中訊號 → 推送並標註「觀察」
         await client.pushMessage(USER_ID, buildSignalCard(pair, a, 'watch'));
         pendingOrders[pair] = { pair, analysis: a };
         setCooldown(pair);
         recordSignal(pair, a.score, a.dir);
         console.log(`🟡 中訊號推送：${pair} 評分${a.score}`);
       } else if (a.score >= 50) {
-        // ⚪ 弱訊號 → 靜默記錄，不推送
         recordSignal(pair, a.score, a.dir);
-        console.log(`⚪ 弱訊號記錄（不推送）：${pair} 評分${a.score}`);
+        console.log(`⚪ 弱訊號記錄：${pair} 評分${a.score}`);
       }
     } catch (e) { console.error(`❌ 推送失敗 ${pair}:`, e.message); }
   }
 }
-
+ 
 // ══════════════════════════════════════════════
 // 8. Webhook
 // ══════════════════════════════════════════════
@@ -712,10 +1053,10 @@ app.post('/webhook', middleware(lineConfig), async (req, res) => {
     if (event.type !== 'message' || event.message.type !== 'text') continue;
     const text = event.message.text.trim();
     const tok  = event.replyToken;
-
+ 
     if (text === 'myid') {
       await client.replyMessage(tok, { type: 'text', text: `你的 ID：\n${event.source.userId}` });
-
+ 
     } else if (text.startsWith('一鍵下單')) {
       const pair = text.replace('一鍵下單','').trim();
       const o = pendingOrders[pair];
@@ -723,7 +1064,7 @@ app.post('/webhook', middleware(lineConfig), async (req, res) => {
       const a = o.analysis;
       const isLong = a.dir === 'long';
       const displayPair = pair.replace(/-SWAP$/, '').replace('-', '/');
-
+ 
       // 手動執行確認訊息（含完整下單參數，請自行前往 OKX 執行）
       const reply =
         `✅ 下單確認\n\n` +
@@ -746,59 +1087,86 @@ app.post('/webhook', middleware(lineConfig), async (req, res) => {
         `📌 請前往 OKX 合約頁面手動執行！`;
       await client.replyMessage(tok, { type: 'text', text: reply });
       delete pendingOrders[pair];
-
+ 
     } else if (text.startsWith('跳過')) {
       const pair = text.replace('跳過','').trim();
       delete pendingOrders[pair];
       await client.replyMessage(tok, { type: 'text', text: `⏭️ 已跳過 ${pair.replace('-','/')}。` });
-
+ 
     } else if (text === '狀態') {
+      const fuseStatus = dailyStats.isFused ? `🚨 已熔斷（今日虧損$${dailyStats.dailyLoss.toFixed(2)}）` : `✅ 正常（今日虧損$${dailyStats.dailyLoss.toFixed(2)}/$${DAILY_MAX_LOSS}）`;
       await client.replyMessage(tok, {
         type: 'text',
-        text: `🤖 SignalAI 狀態\n\n待確認：${Object.keys(pendingOrders).length} 筆\n監控：${WATCH_PAIRS.length} 個幣對\n門檻：${MIN_SCORE}分\n止損上限：$${MAX_LOSS_USDT}\n本金：$${BASE_CAPITAL}\n\n傳「幣對」查看監控清單\n傳「掃描」立即掃描`
+        text: `🤖 CWS-Apex 狀態
+ 
+` +
+          `🪙 BTC趨勢：${btcTrend === 'bull' ? '📈 多頭' : btcTrend === 'bear' ? '📉 空頭' : '⚖️ 中性'}
+` +
+          `🛡 熔斷狀態：${fuseStatus}
+` +
+          `📊 待確認：${Object.keys(pendingOrders).length} 筆
+` +
+          `🔍 監控：${WATCH_PAIRS.length} 個幣對
+` +
+          `⚡ 門檻：${MIN_SCORE}分 | 止損上限 $${MAX_LOSS_USDT}
+` +
+          `💰 本金：$${BASE_CAPITAL} | 流動性門檻 ${(MIN_VOL_USDT/1e6).toFixed(0)}M
+ 
+` +
+          `指令：掃描 / 幣對 / 報告 / 清除冷卻 / 重置熔斷`
       });
-
+ 
     } else if (text === '幣對') {
       await client.replyMessage(tok, { type: 'text', text: `📊 監控清單：\n${WATCH_PAIRS.map(p=>p.replace('-USDT','')).join('、')}` });
-
+ 
     } else if (text === '掃描') {
       await client.replyMessage(tok, { type: 'text', text: '🔍 掃描中…' });
       scanAndPush();
-
+ 
     } else if (text === '報告' || text === '每日報告') {
       await client.replyMessage(tok, buildDailyReport());
-
+ 
     } else if (text === '清除冷卻' || text === '重置') {
       signalCooldown.clear();
       await client.replyMessage(tok, { type: 'text', text: '✅ 已清除所有幣種冷卻，下次掃描將重新評估。' });
+ 
+    } else if (text === '重置熔斷') {
+      dailyStats.isFused = false;
+      dailyStats.dailyLoss = 0;
+      await client.replyMessage(tok, { type: 'text', text: '✅ 熔斷已手動重置，恢復正常掃描。' });
     }
   }
 });
-
+ 
 // ══════════════════════════════════════════════
 // 9. 定時任務
 // ══════════════════════════════════════════════
 cron.schedule('*/3 * * * *', scanAndPush);
 cron.schedule('0 * * * *', updateTopPairs);
-
+cron.schedule('*/15 * * * *', updateBtcTrend); // 每15分鐘更新BTC趨勢
+ 
 // ── 方案D：每天早上 8:00 推送每日報告 ────────
 cron.schedule('0 8 * * *', async () => {
   try {
     const report = buildDailyReport();
     await client.pushMessage(USER_ID, report);
-    // 重置每日統計
+    // 重置每日統計（含熔斷）
     dailyStats.wins = 0;
     dailyStats.losses = 0;
     dailyStats.totalPnl = 0;
     dailyStats.signals = [];
+    dailyStats.dailyLoss = 0;
+    dailyStats.isFused = false;
     dailyStats.date = new Date().toLocaleDateString('zh-TW');
     console.log('📊 每日報告已推送');
   } catch (e) { console.error('每日報告推送失敗:', e.message); }
 }, { timezone: 'Asia/Taipei' });
-
+ 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
   console.log(`🚀 Bot 啟動 Port ${PORT}`);
   await updateTopPairs();
+  await updateBtcTrend();  // 初始化 BTC 趨勢
   await scanAndPush();
 });
+ 
