@@ -18,6 +18,9 @@ const MAX_LOSS_PCT    = parseFloat(process.env.MAX_LOSS_PCT   || '0.05');
 const DAILY_MAX_LOSS  = parseFloat(process.env.DAILY_MAX_LOSS || '50');  // 每日最大虧損熔斷
 const MIN_VOL_USDT    = parseFloat(process.env.MIN_VOL_USDT   || '5000000'); // 流動性門檻 500萬
 const FUND_RATE_LIMIT = parseFloat(process.env.FUND_RATE_LIMIT|| '0.0008'); // 資金費率極值
+const OI_SURGE_RATIO  = parseFloat(process.env.OI_SURGE_RATIO  || '1.3');   // OI 暴增倍數門檻
+const LS_RATIO_BULL   = parseFloat(process.env.LS_RATIO_BULL   || '0.60');  // 大戶多空比多頭門檻
+const LS_RATIO_BEAR   = parseFloat(process.env.LS_RATIO_BEAR   || '0.40');  // 大戶多空比空頭門檻
  
 // ══════════════════════════════════════════════
 // 合約設定（SWAP 永續合約）
@@ -149,6 +152,87 @@ async function getVol24h(instId) {
     volCache.set(instId, { vol24h: vol, ts: Date.now() });
     return vol;
   } catch (e) { return Infinity; } // 查不到視為通過
+}
+ 
+// ── 未平倉量 OI（Open Interest）────────────────────────
+const oiCache = new Map(); // instId → { oi, prevOi, ts }
+async function getOIData(instId) {
+  const cached = oiCache.get(instId);
+  if (cached && Date.now() - cached.ts < 3 * 60 * 1000) return cached;
+  try {
+    // 當前 OI
+    const { data: curr } = await axios.get('https://www.okx.com/api/v5/rubik/stat/contracts/open-interest-volume', {
+      params: { ccy: instId.replace('-USDT-SWAP',''), period: '5m' }
+    });
+    const rows = curr.data || [];
+    if (rows.length < 2) return { oi: 0, prevOi: 0, oiRatio: 1 };
+    const oi     = parseFloat(rows[0][1]);
+    const prevOi = parseFloat(rows[4]?.[1] || rows[1][1]); // 20分鐘前
+    const oiRatio = prevOi > 0 ? oi / prevOi : 1;
+    const result = { oi, prevOi, oiRatio, ts: Date.now() };
+    oiCache.set(instId, result);
+    return result;
+  } catch (e) { return { oi: 0, prevOi: 0, oiRatio: 1 }; }
+}
+ 
+// ── 大戶多空比（Long/Short Ratio）────────────────────
+const lsCache = new Map(); // instId → { lsRatio, ts }
+async function getLSRatio(instId) {
+  const cached = lsCache.get(instId);
+  if (cached && Date.now() - cached.ts < 5 * 60 * 1000) return cached.lsRatio;
+  try {
+    const ccy = instId.replace('-USDT-SWAP','');
+    const { data } = await axios.get('https://www.okx.com/api/v5/rubik/stat/contracts/long-short-account-ratio', {
+      params: { ccy, period: '5m' }
+    });
+    const rows = data.data || [];
+    if (!rows.length) return 0.5;
+    // longRatio = longAcc / (longAcc + shortAcc)
+    const longRatio = parseFloat(rows[0][1]);
+    lsCache.set(instId, { lsRatio: longRatio, ts: Date.now() });
+    return longRatio;
+  } catch (e) { return 0.5; }
+}
+ 
+// ── 經濟日曆（重大事件熔斷）──────────────────────────
+// 使用 investing.com 公開行事曆 API（免費）
+let economicEvents = []; // { time, impact, name }
+let economicEventsUpdatedAt = 0;
+async function updateEconomicCalendar() {
+  try {
+    // 用 axios 抓取 Forex Factory JSON feed
+    const { data } = await axios.get('https://nfs.faireconomy.media/ff_calendar_thisweek.json', {
+      timeout: 8000,
+      headers: { 'User-Agent': 'Mozilla/5.0' }
+    });
+    economicEvents = (data || [])
+      .filter(e => e.impact === 'High')
+      .map(e => ({
+        name:   e.title,
+        time:   new Date(e.date).getTime(),
+        impact: e.impact,
+      }));
+    economicEventsUpdatedAt = Date.now();
+    console.log(`📅 經濟日曆更新：${economicEvents.length} 個高影響事件`);
+  } catch (e) {
+    console.warn('⚠️ 經濟日曆更新失敗:', e.message);
+  }
+}
+ 
+function isEconomicEventSoon(bufferMinutes = 30) {
+  const now = Date.now();
+  return economicEvents.some(e => {
+    const diff = e.time - now;
+    return diff > 0 && diff < bufferMinutes * 60 * 1000;
+  });
+}
+ 
+function getUpcomingEvents(bufferMinutes = 60) {
+  const now = Date.now();
+  return economicEvents.filter(e => {
+    const diff = e.time - now;
+    return diff > -5 * 60 * 1000 && diff < bufferMinutes * 60 * 1000;
+  });
 }
  
 // ── ADX 計算（方案E：市況偵測）───────────────────────
@@ -384,11 +468,13 @@ async function fetchSentiment(coinSymbol) {
 // 5. 綜合分析
 // ══════════════════════════════════════════════
 async function analyze(instId) {
-  const [candles, candles5m, ticker, mtf] = await Promise.all([
+  const [candles, candles5m, ticker, mtf, oiData, lsRatio] = await Promise.all([
     fetchCandles(instId),
     fetchCandles5m(instId),
     fetchTicker(instId).catch(() => null),
-    analyzeMultiTimeframe(instId),   // 方案C：多時框
+    analyzeMultiTimeframe(instId),
+    getOIData(instId),               // OI 未平倉量
+    getLSRatio(instId),              // 大戶多空比
   ]);
   const currentPrice = ticker ? parseFloat(ticker.last) : null;
  
@@ -512,9 +598,27 @@ async function analyze(instId) {
     }
     // 方案E：自適應 — 趨勢模式加重動量，震盪模式加重均值回歸
     if (isTrend) {
-      if (ma10 > ma20 && macd.histogram > 0) { score += 5; } // 趨勢模式：動量加權
+      if (ma10 > ma20 && macd.histogram > 0) { score += 5; }
     } else {
-      if (rsi < 35) { score += 6; } // 震盪模式：超賣更有效
+      if (rsi < 35) { score += 6; }
+    }
+    // ── OI 未平倉量（做多）───────────────────────────
+    if (oiData.oiRatio >= OI_SURGE_RATIO) {
+      // OI 暴增 + 價格漲 = 強多確認
+      if (last.close > candles[1].close) {
+        reasons.push({ t: `OI暴增${oiData.oiRatio.toFixed(1)}x↑多`, ok: true }); score += 12;
+      } else {
+        // OI 暴增 + 價格跌 = 多頭陷阱警告
+        reasons.push({ t: `OI暴增但價跌⚠️`, ok: false }); score -= 8;
+      }
+    } else if (oiData.oiRatio < 0.85) {
+      reasons.push({ t: 'OI驟降謹慎', ok: false }); score -= 5;
+    }
+    // ── 大戶多空比（做多）────────────────────────────
+    if (lsRatio >= LS_RATIO_BULL) {
+      reasons.push({ t: `大戶多方${(lsRatio*100).toFixed(0)}%`, ok: true }); score += 10;
+    } else if (lsRatio <= LS_RATIO_BEAR) {
+      reasons.push({ t: `大戶偏空${((1-lsRatio)*100).toFixed(0)}%`, ok: false }); score -= 8;
     }
  
   // ══════════════════════════════════════════════
@@ -587,6 +691,24 @@ async function analyze(instId) {
     } else {
       if (rsi > 65) { score += 6; }
     }
+    // ── OI 未平倉量（做空）───────────────────────────
+    if (oiData.oiRatio >= OI_SURGE_RATIO) {
+      // OI 暴增 + 價格跌 = 強空確認
+      if (last.close < candles[1].close) {
+        reasons.push({ t: `OI暴增${oiData.oiRatio.toFixed(1)}x↓空`, ok: true }); score += 12;
+      } else {
+        // OI 暴增 + 價格漲 = 空頭陷阱警告
+        reasons.push({ t: `OI暴增但價漲⚠️`, ok: false }); score -= 8;
+      }
+    } else if (oiData.oiRatio < 0.85) {
+      reasons.push({ t: 'OI驟降謹慎', ok: false }); score -= 5;
+    }
+    // ── 大戶多空比（做空）────────────────────────────
+    if (lsRatio <= LS_RATIO_BEAR) {
+      reasons.push({ t: `大戶空方${((1-lsRatio)*100).toFixed(0)}%`, ok: true }); score += 10;
+    } else if (lsRatio >= LS_RATIO_BULL) {
+      reasons.push({ t: `大戶偏多${(lsRatio*100).toFixed(0)}%`, ok: false }); score -= 8;
+    }
  
   // ── 中性（條件不足）──────────────────────────
   } else {
@@ -657,7 +779,8 @@ async function analyze(instId) {
     slAmount, tp1Amount, tp2Amount, tp3Amount, fee,
     doubleCapital, flow5m, rsi, macd, swapSz,
     currentPrice: currentPrice || entry,
-    adx, isTrend, mtfDir: mtf.mtfDir, obvTrend, rsiDiv, // 新指標
+    adx, isTrend, mtfDir: mtf.mtfDir, obvTrend, rsiDiv,
+    oiRatio: oiData.oiRatio, lsRatio, // OI + 大戶多空比
   };
 }
  
@@ -931,9 +1054,11 @@ function buildSignalCard(pair, a, signalLevel = 'strong') {
           { type: 'text', text: a.reasons.filter(r => r.ok).map(r => `✅ ${r.t}`).join('  '), color: '#4ade80', size: 'xxs', wrap: true },
           { type: 'text', text: a.reasons.filter(r => !r.ok).map(r => `❌ ${r.t}`).join('  '), color: '#f87171', size: 'xxs', wrap: true },
           { type: 'text', text: [
-            a.mtfDir !== 'neutral' ? `📡 MTF共振${a.mtfDir==='long'?'多':'空'}` : '',
-            a.obvTrend === 'up' ? '📈 OBV↑' : a.obvTrend === 'down' ? '📉 OBV↓' : '',
-            a.rsiDiv !== 'none' ? (a.rsiDiv==='bullish'?'🔔RSI底背離':'🔔RSI頂背離') : '',
+            a.mtfDir !== 'neutral' ? `📡 MTF${a.mtfDir==='long'?'多':'空'}` : '',
+            a.obvTrend === 'up' ? 'OBV↑' : a.obvTrend === 'down' ? 'OBV↓' : '',
+            a.rsiDiv !== 'none' ? (a.rsiDiv==='bullish'?'🔔底背離':'🔔頂背離') : '',
+            a.oiRatio >= 1.3 ? `OI暴增${a.oiRatio?.toFixed(1)}x` : '',
+            a.lsRatio ? `大戶多${(a.lsRatio*100).toFixed(0)}%` : '',
           ].filter(Boolean).join('  ') || '—', color: '#00cfff', size: 'xxs', wrap: true },
           { type: 'separator', color: '#ffffff12' },
  
@@ -965,18 +1090,26 @@ function buildSignalCard(pair, a, signalLevel = 'strong') {
 // 7. 掃描推送
 // ══════════════════════════════════════════════
 async function scanAndPush() {
-  // ── Phase1：每日熔斷檢查 ─────────────────────────
+  // ── 每日熔斷檢查 ─────────────────────────────────
   if (dailyStats.isFused) {
     console.log('⛔ 今日已熔斷，跳過掃描');
     return;
   }
  
-  // ── Phase1：BTC 市場情緒更新（每10分鐘）──────────
+  // ── 經濟日曆熔斷：重大事件前 30 分鐘暫停 ──────────
+  if (isEconomicEventSoon(30)) {
+    const events = getUpcomingEvents(30);
+    const names  = events.map(e => e.name).join(' / ');
+    console.warn(`📅 重大經濟事件即將發布（${names}），暫停本次掃描`);
+    return;
+  }
+ 
+  // ── BTC 市場情緒更新（每10分鐘）──────────────────
   if (Date.now() - btcTrendUpdatedAt > 10 * 60 * 1000) {
     await updateBtcTrend();
   }
  
-  console.log(`[${new Date().toLocaleTimeString()}] 掃描 ${WATCH_PAIRS.length} 個幣對… BTC趨勢:${btcTrend}`);
+  console.log(`[${new Date().toLocaleTimeString()}] 掃描 ${WATCH_PAIRS.length} 個幣對… BTC:${btcTrend}`);
  
   // ── 方案A：並行分析（速度提升 3-5x）────────────────
   const results = await Promise.allSettled(
@@ -1113,7 +1246,7 @@ app.post('/webhook', middleware(lineConfig), async (req, res) => {
           `💰 本金：$${BASE_CAPITAL} | 流動性門檻 ${(MIN_VOL_USDT/1e6).toFixed(0)}M
  
 ` +
-          `指令：掃描 / 幣對 / 報告 / 清除冷卻 / 重置熔斷`
+          `指令：掃描 / 幣對 / 報告 / 日曆 / OI BTC / 清除冷卻 / 重置熔斷`
       });
  
     } else if (text === '幣對') {
@@ -1134,6 +1267,48 @@ app.post('/webhook', middleware(lineConfig), async (req, res) => {
       dailyStats.isFused = false;
       dailyStats.dailyLoss = 0;
       await client.replyMessage(tok, { type: 'text', text: '✅ 熔斷已手動重置，恢復正常掃描。' });
+ 
+    } else if (text === '日曆' || text === '經濟日曆') {
+      const upcoming = getUpcomingEvents(240); // 未來4小時
+      if (!upcoming.length) {
+        await client.replyMessage(tok, { type: 'text', text: '📅 未來4小時無高影響經濟事件。' });
+      } else {
+        const lines = upcoming.map(e => {
+          const t = new Date(e.time).toLocaleTimeString('zh-TW', { hour: '2-digit', minute: '2-digit', timeZone: 'Asia/Taipei' });
+          return `⚡ ${t} ${e.name}`;
+        }).join('
+');
+        const isSoon = isEconomicEventSoon(30);
+        await client.replyMessage(tok, {
+          type: 'text',
+          text: `📅 即將發布的重大事件
+${isSoon ? '🚨 30分鐘內有事件，掃描已暫停
+' : ''}
+${lines}`
+        });
+      }
+ 
+    } else if (text.startsWith('OI ') || text.startsWith('oi ')) {
+      const symbol = text.split(' ')[1].toUpperCase();
+      const instId = symbol.includes('-SWAP') ? symbol : `${symbol}-USDT-SWAP`;
+      try {
+        const [oi, ls] = await Promise.all([getOIData(instId), getLSRatio(instId)]);
+        await client.replyMessage(tok, {
+          type: 'text',
+          text: `📊 ${symbol} 市場結構
+ 
+` +
+            `📈 未平倉量：${oi.oi > 0 ? oi.oi.toLocaleString() : '—'}
+` +
+            `📊 OI 變化：${oi.oiRatio > 0 ? (oi.oiRatio >= 1.3 ? '🔺暴增' : oi.oiRatio < 0.85 ? '🔻驟降' : '➡️正常') + ` (${oi.oiRatio.toFixed(2)}x)` : '—'}
+` +
+            `👥 大戶多空比：多 ${(ls*100).toFixed(1)}% / 空 ${((1-ls)*100).toFixed(1)}%
+` +
+            `${ls >= LS_RATIO_BULL ? '✅ 大戶偏多' : ls <= LS_RATIO_BEAR ? '🔴 大戶偏空' : '⚖️ 大戶中性'}`
+        });
+      } catch (e) {
+        await client.replyMessage(tok, { type: 'text', text: `❌ 查詢失敗：${e.message}` });
+      }
     }
   }
 });
@@ -1143,7 +1318,8 @@ app.post('/webhook', middleware(lineConfig), async (req, res) => {
 // ══════════════════════════════════════════════
 cron.schedule('*/3 * * * *', scanAndPush);
 cron.schedule('0 * * * *', updateTopPairs);
-cron.schedule('*/15 * * * *', updateBtcTrend); // 每15分鐘更新BTC趨勢
+cron.schedule('*/15 * * * *', updateBtcTrend);
+cron.schedule('0 */6 * * *', updateEconomicCalendar); // 每6小時更新經濟日曆
  
 // ── 方案D：每天早上 8:00 推送每日報告 ────────
 cron.schedule('0 8 * * *', async () => {
@@ -1166,7 +1342,8 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
   console.log(`🚀 Bot 啟動 Port ${PORT}`);
   await updateTopPairs();
-  await updateBtcTrend();  // 初始化 BTC 趨勢
+  await updateBtcTrend();
+  await updateEconomicCalendar(); // 初始化經濟日曆
   await scanAndPush();
 });
  
