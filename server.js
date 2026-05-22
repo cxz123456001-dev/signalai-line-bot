@@ -60,13 +60,23 @@ function fmtDiff(diff, price) {
   return diff >= 0 ? '+' + str : str;
 }
 
-// 固定監控幣對（合約格式）
+// ── 核心必選幣對（流動性佳、技術指標可靠）──────────
 const FIXED_PAIRS = [
-  'BTC-USDT','ETH-USDT','ADA-USDT','DOGE-USDT',
-  'SOL-USDT','HYPE-USDT','XRP-USDT',
-  'ZEC-USDT','LABU-USDT','BILL-USDT',
-  'BSB-USDT','XAC-USDT',
+  'BTC-USDT','ETH-USDT','SOL-USDT',
+  'XRP-USDT','DOGE-USDT','ADA-USDT',
 ];
+
+// ── 動態篩選設定 ─────────────────────────────────────
+const DYN_TOP_N       = parseInt(process.env.DYN_TOP_N        || '20'); // 動態最多幾個
+const DYN_MIN_VOL     = parseFloat(process.env.DYN_MIN_VOL    || '30000000'); // 最低 3000 萬 USDT
+const DYN_ATR_MULT    = parseFloat(process.env.DYN_ATR_MULT   || '1.3');  // ATR 需 > 均值 1.3x
+const DYN_PRICE_CHG   = parseFloat(process.env.DYN_PRICE_CHG  || '0.03'); // 24h 漲跌幅下限 3%
+const DYN_PRICE_MAX   = parseFloat(process.env.DYN_PRICE_MAX  || '0.15'); // 24h 漲跌幅上限 15%
+
+// 動態幣種清單快取
+let dynamicPairs = [];
+let dynamicPairsUpdatedAt = 0;
+let dynamicPairsDetail = []; // 篩選結果詳細資訊（供報告用）
 
 let WATCH_PAIRS = [...FIXED_PAIRS];
 const pendingOrders = {};
@@ -329,23 +339,107 @@ async function analyzeMultiTimeframe(instId) {
 // ══════════════════════════════════════════════
 // 1. 動態抓取交易量前10名幣對
 // ══════════════════════════════════════════════
+// ══════════════════════════════════════════════════════
+// 動態高波動篩選系統
+// 條件：ATR高 + 成交量大 + OI增加 + 24h漲幅適中
+// ══════════════════════════════════════════════════════
 async function updateTopPairs() {
   try {
+    // Step 1：抓全市場 SWAP tickers
     const { data } = await axios.get('https://www.okx.com/api/v5/market/tickers', {
-      params: { instType: 'SWAP' }
+      params: { instType: 'SWAP' }, timeout: 10000,
     });
-    const stableCoins = ['USDT','USDC','DAI','BUSD','TUSD','USDP','FDUSD'];
-    const top10 = data.data
+
+    const stableCoins = ['USDT','USDC','DAI','BUSD','TUSD','USDP','FDUSD','USDD'];
+    const blacklist   = ['LABU','BILL','BSB','XAC','ZEC']; // 低流動性黑名單
+
+    // Step 2：基礎過濾
+    const candidates = data.data
       .filter(t => t.instId.endsWith('-USDT-SWAP'))
       .filter(t => !stableCoins.some(s => t.instId.startsWith(s)))
-      .filter(t => parseFloat(t.volCcy24h) >= MIN_VOL_USDT) // 流動性過濾
-      .sort((a, b) => parseFloat(b.volCcy24h) - parseFloat(a.volCcy24h))
-      .slice(0, 10)
-      .map(t => t.instId);
+      .filter(t => !blacklist.some(b => t.instId.startsWith(b)))
+      .filter(t => parseFloat(t.volCcy24h) >= DYN_MIN_VOL)
+      .map(t => ({
+        instId:    t.instId,
+        vol24h:    parseFloat(t.volCcy24h),
+        price:     parseFloat(t.last),
+        priceChg:  Math.abs(parseFloat(t.chgUtc0 || t.change24h || 0)),
+        openPrice: parseFloat(t.open24h || t.last),
+      }))
+      .filter(t => t.priceChg >= DYN_PRICE_CHG && t.priceChg <= DYN_PRICE_MAX);
 
-    const merged = [...new Set([...FIXED_PAIRS, ...top10])];
+    if (!candidates.length) {
+      console.warn('⚠️ 動態篩選：無符合條件幣種，保持現有清單');
+      return;
+    }
+
+    // Step 3：分批抓 ATR + OI（每批 8 個，避免 429）
+    const top60 = candidates
+      .sort((a, b) => b.vol24h - a.vol24h)
+      .slice(0, 60);
+
+    const allScored = [];
+    for (let i = 0; i < top60.length; i += 8) {
+      const batch = top60.slice(i, i + 8);
+      const batchRes = await Promise.allSettled(batch.map(async t => {
+        try {
+          const [candles, oiData] = await Promise.all([
+            fetchCandles(t.instId, '1H', 25).catch(() => null),
+            getOIData(t.instId).catch(() => ({ oiRatio: 1 })),
+          ]);
+          if (!candles || candles.length < 15) return null;
+
+          // ATR 計算（近14根）
+          const atrCurr = calcATR(candles);
+          const atrAvg  = candles.slice(0, 20).reduce((s, c, i) => {
+            if (i === 0) return s;
+            const prev = candles[i];
+            return s + Math.max(c.high - c.low, Math.abs(c.high - prev.close), Math.abs(c.low - prev.close));
+          }, 0) / 20;
+          const atrRatio = atrAvg > 0 ? atrCurr / atrAvg : 1;
+
+          // 動態評分：ATR × OI × 成交量
+          const score =
+            atrRatio * 40 +                          // ATR 高波動加分
+            (oiData.oiRatio > 1.1 ? 30 : 0) +        // OI 增加加分
+            Math.min(t.vol24h / 1e8, 30);             // 成交量加分（最高30分）
+
+          return {
+            instId:   t.instId,
+            vol24h:   t.vol24h,
+            priceChg: t.priceChg,
+            atrRatio: atrRatio.toFixed(2),
+            oiRatio:  oiData.oiRatio.toFixed(2),
+            score:    parseFloat(score.toFixed(1)),
+          };
+        } catch (_) { return null; }
+      })
+    );
+
+    // Step 4：排序 + 取前 N 個
+    const filtered = scored
+      .filter(r => r.status === 'fulfilled' && r.value !== null)
+      .map(r => r.value)
+      .filter(t => parseFloat(t.atrRatio) >= DYN_ATR_MULT) // ATR 需超過均值 1.3x
+      .sort((a, b) => b.score - a.score)
+      .slice(0, DYN_TOP_N);
+
+    if (!filtered.length) {
+      console.warn('⚠️ 動態篩選後無符合幣種，保持現有清單');
+      return;
+    }
+
+    dynamicPairs = filtered.map(t => t.instId);
+    dynamicPairsDetail = filtered;
+    dynamicPairsUpdatedAt = Date.now();
+
+    // Step 5：合併固定 + 動態，去重，限制總數
+    const merged = [...new Set([...FIXED_PAIRS, ...dynamicPairs])].slice(0, 35);
     WATCH_PAIRS = merged;
-    console.log(`📊 監控幣對更新：${WATCH_PAIRS.join(', ')}`);
+
+    console.log(`🔥 動態篩選完成：${filtered.length} 個高波動幣種`);
+    console.log(`📊 監控清單（${WATCH_PAIRS.length} 個）：${WATCH_PAIRS.map(p => p.replace('-USDT-SWAP','')).join(' ')}`);
+    console.log(`Top5：${filtered.slice(0,5).map(t => `${t.instId.replace('-USDT-SWAP','')}(ATR:${t.atrRatio}x OI:${t.oiRatio}x 分:${t.score})`).join(' | ')}`);
   } catch (e) {
     console.error('更新幣對失敗:', e.message);
   }
@@ -354,10 +448,30 @@ async function updateTopPairs() {
 // ══════════════════════════════════════════════
 // 2. 行情抓取
 // ══════════════════════════════════════════════
+async function fetchWithRetry(url, params, retries = 3) {
+  for (let i = 0; i < retries; i++) {
+    try {
+      const { data } = await axios.get(url, { params, timeout: 10000 });
+      return data;
+    } catch (e) {
+      const status = e.response?.status;
+      if (status === 429) {
+        // 429 速率限制：等待時間指數遞增
+        const wait = (i + 1) * 2000;
+        console.warn(`⏳ 429 速率限制，${wait/1000}s 後重試 (${i+1}/${retries})...`);
+        await new Promise(r => setTimeout(r, wait));
+      } else if (i === retries - 1) {
+        throw e;
+      } else {
+        await new Promise(r => setTimeout(r, 500));
+      }
+    }
+  }
+}
+
 async function fetchCandles(instId, bar = '4H', limit = 50) {
-  const { data } = await axios.get('https://www.okx.com/api/v5/market/candles', {
-    params: { instId, bar, limit }
-  });
+  const data = await fetchWithRetry('https://www.okx.com/api/v5/market/candles', { instId, bar, limit });
+  if (!data?.data?.length) return [];
   return data.data.map(c => ({
     ts: parseInt(c[0]),
     open: parseFloat(c[1]), high: parseFloat(c[2]),
@@ -370,10 +484,8 @@ async function fetchCandles5m(instId) {
 }
 
 async function fetchTicker(instId) {
-  const { data } = await axios.get('https://www.okx.com/api/v5/market/ticker', {
-    params: { instId }
-  });
-  return data.data[0];
+  const data = await fetchWithRetry('https://www.okx.com/api/v5/market/ticker', { instId });
+  return data?.data?.[0] || null;
 }
 
 // ══════════════════════════════════════════════
@@ -425,13 +537,17 @@ function calcBollinger(candles, period = 20) {
 }
 
 function calc5mFlow(candles5m) {
+  if (!candles5m || candles5m.length < 5) {
+    return { bullRatio: 0.5, bearRatio: 0.5, volSurge: 1, avgVol: 0 };
+  }
   const recent = candles5m.slice(0, 5);
   const bullVol = recent.filter(c => c.close > c.open).reduce((s, c) => s + c.vol, 0);
   const bearVol = recent.filter(c => c.close <= c.open).reduce((s, c) => s + c.vol, 0);
   const total = bullVol + bearVol;
   const bullRatio = total > 0 ? bullVol / total : 0.5;
   const avgVol = recent.reduce((s, c) => s + c.vol, 0) / recent.length;
-  const prevAvg = candles5m.slice(5, 10).reduce((s, c) => s + c.vol, 0) / 5;
+  const prev = candles5m.slice(5, 10);
+  const prevAvg = prev.length ? prev.reduce((s, c) => s + c.vol, 0) / prev.length : avgVol;
   const volSurge = prevAvg > 0 ? avgVol / prevAvg : 1;
   return { bullRatio, bearRatio: 1 - bullRatio, volSurge, avgVol };
 }
@@ -469,16 +585,27 @@ async function fetchSentiment(coinSymbol) {
 // ══════════════════════════════════════════════
 async function analyze(instId) {
   const [candles, candles5m, ticker, mtf, oiData, lsRatio] = await Promise.all([
-    fetchCandles(instId),
-    fetchCandles5m(instId),
+    fetchCandles(instId).catch(() => []),
+    fetchCandles5m(instId).catch(() => []),
     fetchTicker(instId).catch(() => null),
-    analyzeMultiTimeframe(instId),
-    getOIData(instId),               // OI 未平倉量
-    getLSRatio(instId),              // 大戶多空比
+    analyzeMultiTimeframe(instId).catch(() => ({ mtfDir: 'neutral', mtfBonus: 0 })),
+    getOIData(instId).catch(() => ({ oi: 0, oiRatio: 1 })),
+    getLSRatio(instId).catch(() => 0.5),
   ]);
-  const currentPrice = ticker ? parseFloat(ticker.last) : null;
 
+  // ── 資料完整性檢查 ─────────────────────────────────
+  if (!candles.length || candles.length < 25) {
+    throw new Error(`K線資料不足（${candles.length} 根）`);
+  }
+  if (!candles5m.length || candles5m.length < 5) {
+    throw new Error(`5m K線資料不足`);
+  }
+
+  const currentPrice = ticker ? parseFloat(ticker.last) : null;
   const last  = candles[0];
+  if (!last?.close || !last?.high || !last?.low || !last?.vol) {
+    throw new Error(`K線欄位缺失`);
+  }
   const prev5 = candles.slice(1, 6);
 
   const resistance = Math.max(...prev5.map(c => c.high));
@@ -1275,10 +1402,20 @@ async function scanAndPush() {
 
   console.log(`[${new Date().toLocaleTimeString('zh-TW', { timeZone: 'Asia/Taipei' })}] 掃描 ${WATCH_PAIRS.length} 個幣對… BTC:${btcTrend}`);
 
-  // ── 方案A：並行分析（速度提升 3-5x）────────────────
-  const results = await Promise.allSettled(
-    WATCH_PAIRS.map(pair => analyze(pair).then(a => ({ pair, a })))
-  );
+  // ── 方案A：分批並行（每批 5 個，避免 429）───────────
+  const BATCH_SIZE = 5;
+  const results = [];
+  for (let i = 0; i < WATCH_PAIRS.length; i += BATCH_SIZE) {
+    const batch = WATCH_PAIRS.slice(i, i + BATCH_SIZE);
+    const batchResults = await Promise.allSettled(
+      batch.map(pair => analyze(pair).then(a => ({ pair, a })))
+    );
+    results.push(...batchResults);
+    // 批次間休息 800ms，避免觸發速率限制
+    if (i + BATCH_SIZE < WATCH_PAIRS.length) {
+      await new Promise(r => setTimeout(r, 800));
+    }
+  }
 
   for (const res of results) {
     if (res.status === 'rejected') { console.error('❌ 分析失敗:', res.reason?.message); continue; }
@@ -1549,6 +1686,34 @@ app.post('/webhook', middleware(lineConfig), async (req, res) => {
         text: `🔄 已恢復預設監控清單\n\n${WATCH_PAIRS.map(p=>p.replace('-USDT-SWAP','')).join('、')}`,
       });
 
+    } else if (text === '熱榜' || text === '動態清單' || text === '波動榜') {
+      // ── 查看當前動態篩選結果 ─────────────────────────
+      if (!dynamicPairsDetail.length) {
+        await client.replyMessage(tok, { type: 'text', text: '⏳ 動態清單尚未初始化，請稍後或輸入「掃描」觸發更新。' });
+        continue;
+      }
+      const ago = Math.round((Date.now() - dynamicPairsUpdatedAt) / 60000);
+      const lines = dynamicPairsDetail.slice(0, 10).map((t, i) => {
+        const sym = t.instId.replace('-USDT-SWAP','');
+        const chgStr = (t.priceChg * 100).toFixed(1) + '%';
+        return `${i+1}. ${sym}  ATR ${t.atrRatio}x  OI ${t.oiRatio}x  漲跌${chgStr}  分${t.score}`;
+      }).join('
+');
+      await client.replyMessage(tok, {
+        type: 'text',
+        text: `🔥 高波動幣種榜（${ago}分前更新）
+` +
+          `━━━━━━━━━━━━
+` +
+          lines + '
+' +
+          `━━━━━━━━━━━━
+` +
+          `共監控 ${WATCH_PAIRS.length} 個幣對
+` +
+          `每30分鐘自動更新`,
+      });
+
     } else if (text === 'BTC' || text === 'btc') {
       // ── 快速查 BTC OI ───────────────────────────────────
       const instId = 'BTC-USDT-SWAP';
@@ -1637,7 +1802,7 @@ function buildWatchlistFlex() {
 // 9. 定時任務
 // ══════════════════════════════════════════════
 cron.schedule('*/3 * * * *', scanAndPush);
-cron.schedule('0 * * * *', updateTopPairs);
+cron.schedule('*/30 * * * *', updateTopPairs); // 每30分鐘重新篩選高波動幣種
 cron.schedule('*/15 * * * *', updateBtcTrend);
 cron.schedule('0 */6 * * *', updateEconomicCalendar); // 每6小時更新經濟日曆
 
