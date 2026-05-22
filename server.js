@@ -85,10 +85,10 @@ const dailyStats = {
   wins: 0, losses: 0, totalPnl: 0, signals: [],
   dailyLoss: 0,           // 今日已虧損（熔斷用）
   isFused: false,         // 今日熔斷旗標
-  date: new Date().toLocaleDateString('zh-TW'),
+  date: new Date().toLocaleDateString('zh-TW', { timeZone: 'Asia/Taipei' }),
 };
 function recordSignal(pair, score, dir) {
-  dailyStats.signals.push({ pair, score, dir, time: new Date().toLocaleTimeString('zh-TW') });
+  dailyStats.signals.push({ pair, score, dir, time: new Date().toLocaleTimeString('zh-TW', { timeZone: 'Asia/Taipei' }) });
 }
 function addDailyLoss(amount) {
   dailyStats.dailyLoss += amount;
@@ -891,7 +891,7 @@ function buildCommandMenu() {
 
   return {
     type: 'flex',
-    altText: '📋 CWS-Apex 指令選單',
+    altText: '📋 Alice 指令選單',
     contents: {
       type: 'bubble', size: 'giga',
       styles: { body: { backgroundColor: '#0D1117' } },
@@ -906,7 +906,7 @@ function buildCommandMenu() {
               {
                 type: 'box', layout: 'vertical', flex: 1,
                 contents: [
-                  { type: 'text', text: '🔷 CWS-Apex 指令中心', color: '#00CFFF', size: 'md', weight: 'bold' },
+                  { type: 'text', text: '🔷 Alice 指令中心', color: '#00CFFF', size: 'md', weight: 'bold' },
                   { type: 'text', text: now, color: '#6B7A99', size: 'xxs' },
                 ]
               },
@@ -1066,7 +1066,7 @@ function buildDailyReport() {
       header: {
         type: 'box', layout: 'vertical', backgroundColor: '#0a0e1a', paddingAll: '12px',
         contents: [
-          { type: 'text', text: '📊 CWS-Apex 每日報告', color: '#7eb3f7', size: 'sm', weight: 'bold' },
+          { type: 'text', text: '📊 Alice 每日報告', color: '#7eb3f7', size: 'sm', weight: 'bold' },
           { type: 'text', text: dailyStats.date, color: '#6b7a99', size: 'xs' },
         ]
       },
@@ -1122,7 +1122,7 @@ function buildSignalCard(pair, a, signalLevel = 'strong') {
   const levelColor = isStrong ? '#ff4466' : '#FFD600';
   const headerBg  = isStrong ? '#0a0e1a' : '#1a1400';
   const emoji     = isStrong ? '🔴' : '🟡';
-  const now       = new Date().toLocaleTimeString('zh-TW', { hour: '2-digit', minute: '2-digit' });
+  const now       = new Date().toLocaleTimeString('zh-TW', { hour: '2-digit', minute: '2-digit', timeZone: 'Asia/Taipei' });
   const displayPair = pair.replace(/-SWAP$/, '').replace(/-/g, '/');
 
   // 當下即時價格（分析時抓到的 entry 就是最新成交價）
@@ -1142,7 +1142,7 @@ function buildSignalCard(pair, a, signalLevel = 'strong') {
           {
             type: 'box', layout: 'vertical', flex: 1,
             contents: [
-              { type: 'text', text: '📊 CWS-Apex 訊號', color: '#7eb3f7', size: 'sm', weight: 'bold' },
+              { type: 'text', text: '📊 Alice 訊號', color: '#7eb3f7', size: 'sm', weight: 'bold' },
               { type: 'text', text: now, color: '#6b7a99', size: 'xs' },
             ]
           },
@@ -1273,7 +1273,7 @@ async function scanAndPush() {
     await updateBtcTrend();
   }
 
-  console.log(`[${new Date().toLocaleTimeString()}] 掃描 ${WATCH_PAIRS.length} 個幣對… BTC:${btcTrend}`);
+  console.log(`[${new Date().toLocaleTimeString('zh-TW', { timeZone: 'Asia/Taipei' })}] 掃描 ${WATCH_PAIRS.length} 個幣對… BTC:${btcTrend}`);
 
   // ── 方案A：並行分析（速度提升 3-5x）────────────────
   const results = await Promise.allSettled(
@@ -1394,7 +1394,7 @@ app.post('/webhook', middleware(lineConfig), async (req, res) => {
       const fuseStatus = dailyStats.isFused ? `🚨 已熔斷（今日虧損$${dailyStats.dailyLoss.toFixed(2)}）` : `✅ 正常（今日虧損$${dailyStats.dailyLoss.toFixed(2)}/$${DAILY_MAX_LOSS}）`;
       await client.replyMessage(tok, {
         type: 'text',
-        text: `🤖 CWS-Apex 狀態
+        text: `🤖 Alice 狀態
 
 ` +
           `🪙 BTC趨勢：${btcTrend === 'bull' ? '📈 多頭' : btcTrend === 'bear' ? '📉 空頭' : '⚖️ 中性'}
@@ -1653,7 +1653,7 @@ cron.schedule('0 8 * * *', async () => {
     dailyStats.signals = [];
     dailyStats.dailyLoss = 0;
     dailyStats.isFused = false;
-    dailyStats.date = new Date().toLocaleDateString('zh-TW');
+    dailyStats.date = new Date().toLocaleDateString('zh-TW', { timeZone: 'Asia/Taipei' });
     console.log('📊 每日報告已推送');
   } catch (e) { console.error('每日報告推送失敗:', e.message); }
 }, { timezone: 'Asia/Taipei' });
