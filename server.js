@@ -245,6 +245,58 @@ function getUpcomingEvents(bufferMinutes = 60) {
   });
 }
  
+// ══════════════════════════════════════════════════════
+// 附加資料批次快取系統
+// OI / LSR / FundRate / MTF 統一預先抓取，analyze 只讀快取
+// 大幅降低每次掃描的 API 呼叫次數（從 9次/幣 → 3次/幣）
+// ══════════════════════════════════════════════════════
+const sideDataCache = new Map(); // instId → { oi, lsRatio, fundRate, ts }
+const mtfCache      = new Map(); // instId → { mtfDir, mtfBonus }
+
+function getSideData(instId) {
+  return sideDataCache.get(instId) || {
+    oi: { oi: 0, oiRatio: 1 }, lsRatio: 0.5, fundRate: 0,
+  };
+}
+
+async function refreshSideData(pairs) {
+  console.log(`🔄 批次更新 ${pairs.length} 個幣種附加資料...`);
+  for (let i = 0; i < pairs.length; i += 3) {
+    const batch = pairs.slice(i, i + 3);
+    await Promise.allSettled(batch.map(async instId => {
+      try {
+        const swapId = instId.endsWith('-SWAP') ? instId : instId + '-SWAP';
+        const [oiRes, lsRes, frRes] = await Promise.allSettled([
+          getOIData(swapId),
+          getLSRatio(swapId),
+          getFundRate(swapId),
+        ]);
+        sideDataCache.set(instId, {
+          oi:       oiRes.status  === 'fulfilled' ? oiRes.value  : { oi: 0, oiRatio: 1 },
+          lsRatio:  lsRes.status  === 'fulfilled' ? lsRes.value  : 0.5,
+          fundRate: frRes.status  === 'fulfilled' ? frRes.value  : 0,
+          ts: Date.now(),
+        });
+      } catch (_) {}
+    }));
+    if (i + 3 < pairs.length) await new Promise(r => setTimeout(r, 1200));
+  }
+  console.log(`✅ 附加資料快取更新完成`);
+}
+
+async function refreshMtfCache(pairs) {
+  for (let i = 0; i < pairs.length; i += 4) {
+    const batch = pairs.slice(i, i + 4);
+    await Promise.allSettled(batch.map(async instId => {
+      try {
+        const result = await analyzeMultiTimeframe(instId);
+        mtfCache.set(instId, result);
+      } catch (_) {}
+    }));
+    if (i + 4 < pairs.length) await new Promise(r => setTimeout(r, 800));
+  }
+}
+
 // ── ADX 計算（方案E：市況偵測）───────────────────────
 function calcADX(candles, period = 14) {
   if (candles.length < period + 2) return 25;
@@ -587,13 +639,18 @@ async function fetchSentiment(coinSymbol) {
 // 5. 綜合分析
 // ══════════════════════════════════════════════
 async function analyze(instId) {
-  const [candles, candles5m, ticker, mtf, oiData, lsRatio] = await Promise.all([
+  // 附加資料從快取讀取（每5分鐘統一更新，不在此打API）
+  const side = getSideData(instId);
+  const oiData   = side.oi;
+  const lsRatio  = side.lsRatio;
+
+  // MTF 也從快取讀（在 scanAndPush 前批次計算）
+  const mtf = mtfCache.get(instId) || { mtfDir: 'neutral', mtfBonus: 0 };
+
+  const [candles, candles5m, ticker] = await Promise.all([
     fetchCandles(instId).catch(() => []),
     fetchCandles5m(instId).catch(() => []),
     fetchTicker(instId).catch(() => null),
-    analyzeMultiTimeframe(instId).catch(() => ({ mtfDir: 'neutral', mtfBonus: 0 })),
-    getOIData(instId).catch(() => ({ oi: 0, oiRatio: 1 })),
-    getLSRatio(instId).catch(() => 0.5),
   ]);
  
   // ── 資料完整性檢查 ─────────────────────────────────
@@ -1405,7 +1462,11 @@ async function scanAndPush() {
  
   console.log(`[${new Date().toLocaleTimeString('zh-TW', { timeZone: 'Asia/Taipei' })}] 掃描 ${WATCH_PAIRS.length} 個幣對… BTC:${btcTrend}`);
  
-  // ── 方案A：分批並行（每批 5 個，避免 429）───────────
+  // ── 預先批次更新附加資料（OI/LSR/FundRate/MTF）──────
+  await refreshSideData(WATCH_PAIRS);
+  await refreshMtfCache(WATCH_PAIRS);
+
+  // ── 分批並行掃描（每批 5 個）────────────────────────
   const BATCH_SIZE = 5;
   const results = [];
   for (let i = 0; i < WATCH_PAIRS.length; i += BATCH_SIZE) {
@@ -1414,9 +1475,9 @@ async function scanAndPush() {
       batch.map(pair => analyze(pair).then(a => ({ pair, a })))
     );
     results.push(...batchResults);
-    // 批次間休息 800ms，避免觸發速率限制
+    // 批次間休息 1500ms
     if (i + BATCH_SIZE < WATCH_PAIRS.length) {
-      await new Promise(r => setTimeout(r, 800));
+      await new Promise(r => setTimeout(r, 1500));
     }
   }
  
@@ -1426,12 +1487,9 @@ async function scanAndPush() {
     try {
       if (a.dir === 'neutral') continue;
  
-      // ── Phase1：流動性過濾 ─────────────────────────
-      const vol24h = await getVol24h(pair);
-      if (vol24h < MIN_VOL_USDT) {
-        console.log(`💧 ${pair} 流動性不足(${(vol24h/1e6).toFixed(1)}M)，跳過`);
-        continue;
-      }
+      // ── Phase1：流動性過濾（讀快取）──────────────
+      const sideD = getSideData(pair);
+      const fundRateNow = sideD.fundRate;
  
       // ── Phase1：BTC 情緒過濾 ──────────────────────
       if (a.dir === 'long' && btcTrend === 'bear') {
@@ -1443,14 +1501,13 @@ async function scanAndPush() {
         continue;
       }
  
-      // ── Phase2：資金費率過濾 ──────────────────────
-      const fundRate = await getFundRate(pair);
-      if (a.dir === 'long'  && fundRate >  FUND_RATE_LIMIT) {
-        console.log(`💸 ${pair} 資金費率過高(${(fundRate*100).toFixed(4)}%)，跳過做多`);
+      // ── Phase2：資金費率過濾（讀快取）────────────
+      if (a.dir === 'long'  && fundRateNow >  FUND_RATE_LIMIT) {
+        console.log(`💸 ${pair} 資金費率過高(${(fundRateNow*100).toFixed(4)}%)，跳過做多`);
         continue;
       }
-      if (a.dir === 'short' && fundRate < -FUND_RATE_LIMIT) {
-        console.log(`💸 ${pair} 資金費率過負(${(fundRate*100).toFixed(4)}%)，跳過做空`);
+      if (a.dir === 'short' && fundRateNow < -FUND_RATE_LIMIT) {
+        console.log(`💸 ${pair} 資金費率過負(${(fundRateNow*100).toFixed(4)}%)，跳過做空`);
         continue;
       }
  
@@ -1828,4 +1885,3 @@ app.listen(PORT, async () => {
   await updateEconomicCalendar(); // 初始化經濟日曆
   await scanAndPush();
 });
- 
