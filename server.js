@@ -73,6 +73,9 @@ const DYN_PRICE_MAX   = parseFloat(process.env.DYN_PRICE_MAX  || '0.15'); // 24h
 let dynamicPairs = [];
 let dynamicPairsUpdatedAt = 0;
 let dynamicPairsDetail = []; // 篩選結果詳細資訊（供報告用）
+
+const sideDataCache = new Map(); // 補上資金費率快取
+const mtfCache = new Map();      // 補上多時框分析快取
  
 let WATCH_PAIRS = [...FIXED_PAIRS];
 const pendingOrders = {};
