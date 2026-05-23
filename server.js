@@ -1200,3 +1200,84 @@ app.post('/webhook', middleware(lineConfig), async (req, res) => {
 });
  
  
+// ══════════════════════════════════════════════
+// Keep-Alive：防止 Render 免費方案休眠
+// ══════════════════════════════════════════════
+const RENDER_URL = process.env.RENDER_URL || '';
+app.get('/ping', (req, res) => res.send('pong 🏓'));
+app.get('/health', (req, res) => res.json({
+  status: 'ok',
+  uptime: Math.floor(process.uptime()),
+  pairs: WATCH_PAIRS?.length ?? 0,
+  pending: Object.keys(pendingOrders ?? {}).length,
+  time: new Date().toLocaleString('zh-TW', { timeZone: 'Asia/Taipei' }),
+}));
+ 
+// ══════════════════════════════════════════════
+// 定時任務
+// ══════════════════════════════════════════════
+cron.schedule('*/3 * * * *', scanAndPush);
+cron.schedule('*/30 * * * *', updateTopPairs);
+cron.schedule('*/15 * * * *', updateBtcTrend);
+ 
+// 每 30 分鐘清除超過 2 小時的過期待確認訂單
+cron.schedule('*/30 * * * *', () => {
+  const expireMs = 2 * 60 * 60 * 1000;
+  const now = Date.now();
+  let cleared = 0;
+  for (const [pair, order] of Object.entries(pendingOrders)) {
+    if (order.createdAt && now - order.createdAt > expireMs) {
+      delete pendingOrders[pair];
+      cleared++;
+    }
+  }
+  if (cleared > 0) console.log(`🧹 清除 ${cleared} 筆過期訂單`);
+});
+ 
+// 每天 00:00 重置每日統計與熔斷
+cron.schedule('0 0 * * *', () => {
+  dailyStats.dailyLoss = 0;
+  dailyStats.isFused   = false;
+  dailyStats.signals   = [];
+  dailyStats.date      = new Date().toLocaleDateString('zh-TW', { timeZone: 'Asia/Taipei' });
+  console.log('🔄 每日統計重置完成');
+}, { timezone: 'Asia/Taipei' });
+ 
+// ══════════════════════════════════════════════
+// 啟動
+// ══════════════════════════════════════════════
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, async () => {
+  console.log(`🚀 Alice Bot 啟動 Port ${PORT}`);
+  await updateTopPairs();
+  await updateBtcTrend();
+  await refreshSideData(WATCH_PAIRS);
+  await scanAndPush();
+ 
+  // Keep-alive：每 8 分鐘 ping 自己
+  if (RENDER_URL) {
+    setInterval(async () => {
+      try {
+        const res = await axios.get(`${RENDER_URL}/ping`, { timeout: 10000 });
+        console.log(`💓 Keep-alive ping OK (${res.status})`);
+      } catch (e) {
+        console.warn(`⚠️ Keep-alive ping 失敗: ${e.message}`);
+      }
+    }, 8 * 60 * 1000);
+    console.log(`💓 Keep-alive 已啟動 → ${RENDER_URL}/ping`);
+  }
+ 
+  // Watchdog：14 分鐘無掃描自動觸發
+  let lastCronAt = Date.now();
+  const _origScan = scanAndPush;
+  setInterval(() => {
+    const elapsed = (Date.now() - lastCronAt) / 1000;
+    if (elapsed > 14 * 60) {
+      console.warn(`⚠️ Watchdog：${Math.floor(elapsed)}s 未掃描，強制觸發`);
+      lastCronAt = Date.now();
+      scanAndPush().catch(e => console.error('Watchdog 觸發失敗:', e.message));
+    }
+  }, 60 * 1000);
+  console.log('🐕 Watchdog 已啟動');
+});
+ 
