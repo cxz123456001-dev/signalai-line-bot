@@ -1274,12 +1274,6 @@ async function scanAndPush() {
     return;
   }
  
-  if (isEconomicEventSoon(30)) {
-    const events = getUpcomingEvents(30);
-    const names  = events.map(e => e.name).join(' / ');
-    console.warn(`📅 重大經濟事件即將發布（${names}），暫停本次掃描`);
-    return;
-  }
  
   // ── BTC 市場情緒更新（每10分鐘）──────────────────
   if (Date.now() - btcTrendUpdatedAt > 10 * 60 * 1000) {
@@ -1346,13 +1340,13 @@ async function scanAndPush() {
       // ── 方案C：訊號強度分級推送 ───────────────────
       if (a.score >= 80) {
         await client.pushMessage(USER_ID, buildSignalCard(pair, a, 'strong'));
-        pendingOrders[pair] = { pair, analysis: a };
+        pendingOrders[pair] = { pair, analysis: a, createdAt: Date.now() };
         setCooldown(pair);
         recordSignal(pair, a.score, a.dir);
         console.log(`🔴 強訊號推送：${pair} 評分${a.score} ADX${a.adx?.toFixed(0)} MTF:${a.mtfDir}`);
       } else if (a.score >= MIN_SCORE) {
         await client.pushMessage(USER_ID, buildSignalCard(pair, a, 'watch'));
-        pendingOrders[pair] = { pair, analysis: a };
+        pendingOrders[pair] = { pair, analysis: a, createdAt: Date.now() };
         setCooldown(pair);
         recordSignal(pair, a.score, a.dir);
         console.log(`🟡 中訊號推送：${pair} 評分${a.score}`);
@@ -1602,6 +1596,20 @@ function buildWatchlistFlex() {
 // 9. 定時任務
 // ══════════════════════════════════════════════
 cron.schedule('*/3 * * * *', scanAndPush);
+
+// 每 30 分鐘清除超過 2 小時的過期待確認訂單
+cron.schedule('*/30 * * * *', () => {
+  const expireMs = 2 * 60 * 60 * 1000; // 2 小時
+  const now = Date.now();
+  let cleared = 0;
+  for (const [pair, order] of Object.entries(pendingOrders)) {
+    if (order.createdAt && now - order.createdAt > expireMs) {
+      delete pendingOrders[pair];
+      cleared++;
+    }
+  }
+  if (cleared > 0) console.log(`🧹 清除 ${cleared} 筆過期訂單`);
+});
 cron.schedule('*/30 * * * *', updateTopPairs); // 每30分鐘重新篩選高波動幣種
 cron.schedule('*/15 * * * *', updateBtcTrend);
  
