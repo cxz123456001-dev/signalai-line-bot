@@ -118,8 +118,9 @@ let btcTrend = 'neutral'; // 'bull' | 'bear' | 'neutral'
 let btcTrendUpdatedAt = 0;
 async function updateBtcTrend() {
   try {
-    const candles = await fetchCandles('BTC-USDT-SWAP', '1H', 25);
-    const ma20 = candles.slice(0, 20).reduce((s, c) => s + c.close, 0) / 20;
+    const candles = await fetchCandles('BTC-USDT-SWAP', '1H', 25).catch(() => []);
+    if (!candles.length) return;
+    const ma20 = candles.slice(0, 20).reduce((s, c) => s + c.close, 0) / Math.min(20, candles.length);
     const price = candles[0].close;
     const macd  = calcMACD(candles);
     if (price > ma20 && macd.histogram > 0)       btcTrend = 'bull';
@@ -247,10 +248,11 @@ function getATRMultiplier(atr, candles) {
 async function analyzeMultiTimeframe(instId) {
   try {
     const [c4h, c1h] = await Promise.all([
-      fetchCandles(instId, '4H', 30),
-      fetchCandles(instId, '1H', 30),
+      fetchCandles(instId, '4H', 30).catch(() => []),
+      fetchCandles(instId, '1H', 30).catch(() => []),
     ]);
-    const ma20_4h  = c4h.slice(0, 20).reduce((s, c) => s + c.close, 0) / 20;
+    if (!c4h.length || !c1h.length) return { mtfDir: 'neutral', mtfBonus: 0 };
+    const ma20_4h  = c4h.slice(0, 20).reduce((s, c) => s + c.close, 0) / Math.min(20, c4h.length);
     const macd4h   = calcMACD(c4h);
     const ma20_1h  = c1h.slice(0, 20).reduce((s, c) => s + c.close, 0) / 20;
     const rsi1h    = calcRSI(c1h);
@@ -482,7 +484,7 @@ function calc5mFlow(candles5m) {
   const bullRatio = total > 0 ? bullVol / total : 0.5;
   const avgVol = recent.reduce((s, c) => s + c.vol, 0) / recent.length;
   const prev = candles5m.slice(5, 10);
-  const prevAvg = prev.length ? prev.reduce((s, c) => s + c.vol, 0) / prev.length : avgVol;
+  const prevAvg = (prev.length && avgVol > 0) ? prev.reduce((s, c) => s + c.vol, 0) / prev.length : avgVol || 1;
   const volSurge = prevAvg > 0 ? avgVol / prevAvg : 1;
   return { bullRatio, bearRatio: 1 - bullRatio, volSurge, avgVol };
 }
@@ -490,30 +492,6 @@ function calc5mFlow(candles5m) {
 // ══════════════════════════════════════════════
 // 4. 市場輿情（CryptoPanic + Fear & Greed）
 // ══════════════════════════════════════════════
-async function fetchSentiment(coinSymbol) {
-  try {
-    const fgRes = await axios.get('https://api.alternative.me/fng/?limit=1');
-    const fgValue = parseInt(fgRes.data.data[0].value);
-    const fgLabel = fgRes.data.data[0].value_classification;
- 
-    let newsScore = 0;
-    let newsItems = [];
-    try {
-      const coin = coinSymbol.replace('-USDT','');
-      const newsRes = await axios.get(`https://cryptopanic.com/api/v1/posts/?auth_token=free&currencies=${coin}&kind=news&public=true`);
-      const posts = newsRes.data.results?.slice(0, 5) || [];
-      for (const p of posts) {
-        if (p.votes?.positive > p.votes?.negative) newsScore += 1;
-        else if (p.votes?.negative > p.votes?.positive) newsScore -= 1;
-        newsItems.push(p.title?.slice(0, 40) + '…');
-      }
-    } catch (_) {}
- 
-    return { fgValue, fgLabel, newsScore, newsItems };
-  } catch (e) {
-    return { fgValue: 50, fgLabel: 'Neutral', newsScore: 0, newsItems: [] };
-  }
-}
  
 // ══════════════════════════════════════════════
 // 5. 綜合分析
@@ -526,7 +504,7 @@ async function analyze(instId) {
   const mtf = mtfCache.get(instId) || { mtfDir: 'neutral', mtfBonus: 0 };
 
   const [candles, candles5m, ticker] = await Promise.all([
-    fetchCandles(instId).catch(() => []),
+    fetchCandles(instId, '1H', 50).catch(() => []),
     fetchCandles5m(instId).catch(() => []),
     fetchTicker(instId).catch(() => null),
   ]);
@@ -809,7 +787,6 @@ async function analyze(instId) {
     doubleCapital, flow5m, rsi, macd, swapSz,
     currentPrice: currentPrice || entry,
     adx, isTrend, mtfDir: mtf.mtfDir, obvTrend, rsiDiv,
-    oiRatio: oiData.oiRatio, lsRatio, // OI + 大戶多空比
   };
 }
  
@@ -1238,7 +1215,6 @@ function buildSignalCard(pair, a, signalLevel = 'strong') {
             a.mtfDir !== 'neutral' ? `📡 MTF${a.mtfDir==='long'?'多':'空'}` : '',
             a.obvTrend === 'up' ? 'OBV↑' : a.obvTrend === 'down' ? 'OBV↓' : '',
             a.rsiDiv !== 'none' ? (a.rsiDiv==='bullish'?'🔔底背離':'🔔頂背離') : '',
-            a.oiRatio >= 1.3 ? `OI暴增${a.oiRatio?.toFixed(1)}x` : '',
           ].filter(Boolean).join('  ') || '—', color: '#00cfff', size: 'xxs', wrap: true },
           { type: 'separator', color: '#ffffff12' },
  
