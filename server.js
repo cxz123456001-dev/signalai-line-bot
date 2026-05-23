@@ -135,7 +135,7 @@ async function updateBtcTrend() {
 const fundRateCache = new Map(); // instId → { rate, ts }
 async function getFundRate(instId) {
   const cached = fundRateCache.get(instId);
-  if (cached && Date.now() - cached.ts < 5 * 60 * 1000) return cached.rate;
+  if (cached && Date.now() - cached.ts < 15 * 60 * 1000) return cached.rate;
   try {
     const { data } = await axios.get('https://www.okx.com/api/v5/public/funding-rate', {
       params: { instId }
@@ -171,15 +171,15 @@ async function refreshSideData(pairs) {
 }
 
 async function refreshMtfCache(pairs) {
-  for (let i = 0; i < pairs.length; i += 4) {
-    const batch = pairs.slice(i, i + 4);
+  for (let i = 0; i < pairs.length; i += 2) {
+    const batch = pairs.slice(i, i + 2);
     await Promise.allSettled(batch.map(async instId => {
       try {
         const result = await analyzeMultiTimeframe(instId);
         mtfCache.set(instId, result);
       } catch (_) {}
     }));
-    if (i + 4 < pairs.length) await new Promise(r => setTimeout(r, 800));
+    if (i + 2 < pairs.length) await new Promise(r => setTimeout(r, 2000));
   }
 }
 
@@ -315,11 +315,11 @@ async function updateTopPairs() {
     // Step 3：分批抓 ATR + OI（每批 8 個，避免 429）
     const top60 = candidates
       .sort((a, b) => b.vol24h - a.vol24h)
-      .slice(0, 60);
+      .slice(0, 30); // 降低候選數量減少API呼叫
  
     const allScored = [];
     for (let i = 0; i < top60.length; i += 8) {
-      const batch = top60.slice(i, i + 8);
+      const batch = top60.slice(i, i + 4);
       const batchRes = await Promise.allSettled(batch.map(async t => {
         try {
           const candles = await fetchCandles(t.instId, '1H', 25).catch(() => null);
@@ -349,7 +349,7 @@ async function updateTopPairs() {
         } catch (_) { return null; }
       }));
       allScored.push(...batchRes);
-      if (i + 8 < top60.length) await new Promise(r => setTimeout(r, 600));
+      if (i + 4 < top60.length) await new Promise(r => setTimeout(r, 1500));
     }
     const scored = allScored;
  
@@ -385,24 +385,64 @@ async function updateTopPairs() {
 // ══════════════════════════════════════════════
 // 2. 行情抓取
 // ══════════════════════════════════════════════
+// ══════════════════════════════════════════════
+// 全域 API 限速器（最多 8 次/秒，OKX 上限20次/秒）
+// 所有 OKX API 呼叫都必須通過此限速器
+// ══════════════════════════════════════════════
+const rateLimiter = {
+  queue: [],
+  running: 0,
+  maxConcurrent: 3,        // 最多 3 個並行請求
+  minInterval: 350,        // 每個請求間隔至少 350ms
+  lastCallTime: 0,
+
+  async acquire() {
+    return new Promise(resolve => {
+      this.queue.push(resolve);
+      this._next();
+    });
+  },
+
+  async _next() {
+    if (this.running >= this.maxConcurrent || !this.queue.length) return;
+    const now = Date.now();
+    const wait = Math.max(0, this.minInterval - (now - this.lastCallTime));
+    if (wait > 0) {
+      await new Promise(r => setTimeout(r, wait));
+    }
+    if (!this.queue.length) return;
+    const resolve = this.queue.shift();
+    this.running++;
+    this.lastCallTime = Date.now();
+    resolve(() => {
+      this.running--;
+      this._next();
+    });
+  }
+};
+
 async function fetchWithRetry(url, params, retries = 3) {
-  for (let i = 0; i < retries; i++) {
-    try {
-      const { data } = await axios.get(url, { params, timeout: 10000 });
-      return data;
-    } catch (e) {
-      const status = e.response?.status;
-      if (status === 429) {
-        // 429 速率限制：等待時間指數遞增
-        const wait = (i + 1) * 2000;
-        console.warn(`⏳ 429 速率限制，${wait/1000}s 後重試 (${i+1}/${retries})...`);
-        await new Promise(r => setTimeout(r, wait));
-      } else if (i === retries - 1) {
-        throw e;
-      } else {
-        await new Promise(r => setTimeout(r, 500));
+  const release = await rateLimiter.acquire();
+  try {
+    for (let i = 0; i < retries; i++) {
+      try {
+        const { data } = await axios.get(url, { params, timeout: 12000 });
+        return data;
+      } catch (e) {
+        const status = e.response?.status;
+        if (status === 429) {
+          const wait = (i + 1) * 3000;
+          console.warn(`⏳ 429 速率限制，${wait/1000}s 後重試 (${i+1}/${retries})...`);
+          await new Promise(r => setTimeout(r, wait));
+        } else if (i === retries - 1) {
+          throw e;
+        } else {
+          await new Promise(r => setTimeout(r, 800));
+        }
       }
     }
+  } finally {
+    release();
   }
 }
  
@@ -1265,7 +1305,7 @@ async function scanAndPush() {
   await refreshMtfCache(WATCH_PAIRS);
 
   // ── 分批並行掃描（每批 5 個）────────────────────────
-  const BATCH_SIZE = 5;
+  const BATCH_SIZE = 3; // 降低並行數，配合限速器
   const results = [];
   for (let i = 0; i < WATCH_PAIRS.length; i += BATCH_SIZE) {
     const batch = WATCH_PAIRS.slice(i, i + BATCH_SIZE);
@@ -1275,7 +1315,7 @@ async function scanAndPush() {
     results.push(...batchResults);
     // 批次間休息 1500ms
     if (i + BATCH_SIZE < WATCH_PAIRS.length) {
-      await new Promise(r => setTimeout(r, 1500));
+      await new Promise(r => setTimeout(r, 2000));
     }
   }
  
