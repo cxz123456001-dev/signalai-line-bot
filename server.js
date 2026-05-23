@@ -1561,7 +1561,6 @@ app.post('/webhook', middleware(lineConfig), async (req, res) => {
  
     } else if (text === '掃描') {
       await client.replyMessage(tok, { type: 'text', text: '🔍 掃描中…' });
-      scanAndPush();
  
     } else if (text === '報告' || text === '每日報告') {
       await client.replyMessage(tok, buildDailyReport());
