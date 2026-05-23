@@ -1383,7 +1383,7 @@ function buildSignalCard(pair, a, signalLevel = 'strong') {
 // ══════════════════════════════════════════════
 // 7. 掃描推送
 // ══════════════════════════════════════════════
-async function scanAndPush() {
+
   // ── 每日熔斷檢查 ─────────────────────────────────
   if (dailyStats.isFused) {
     console.log('⛔ 今日已熔斷，跳過掃描');
