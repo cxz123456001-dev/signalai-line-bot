@@ -88,9 +88,9 @@ function setCooldown(pair) { signalCooldown.set(pair, Date.now()); }
  
 // ── 每日績效記錄 ─────────────────────────────────────
 const dailyStats = {
-  wins: 0, losses: 0, totalPnl: 0, signals: [],
-  dailyLoss: 0,           // 今日已虧損（熔斷用）
-  isFused: false,         // 今日熔斷旗標
+  signals: [],
+  dailyLoss: 0,
+  isFused: false,
   date: new Date().toLocaleDateString('zh-TW', { timeZone: 'Asia/Taipei' }),
 };
 function recordSignal(pair, score, dir) {
@@ -149,11 +149,11 @@ async function getFundRate(instId) {
 // ── 快取變數宣告 ─────────────────────────────────────
 const sideDataCache = new Map(); // instId → { fundRate, ts }
 const mtfCache      = new Map(); // instId → { mtfDir, mtfBonus }
-
+ 
 function getSideData(instId) {
   return sideDataCache.get(instId) || { fundRate: 0 };
 }
-
+ 
 async function refreshSideData(pairs) {
   console.log(`🔄 批次更新 ${pairs.length} 個幣種資金費率...`);
   for (let i = 0; i < pairs.length; i += 5) {
@@ -169,73 +169,51 @@ async function refreshSideData(pairs) {
   }
   console.log(`✅ 資金費率快取更新完成`);
 }
-
-async function refreshMtfCache(pairs) {
-  for (let i = 0; i < pairs.length; i += 2) {
-    const batch = pairs.slice(i, i + 2);
-    await Promise.allSettled(batch.map(async instId => {
-      try {
-        const result = await analyzeMultiTimeframe(instId);
-        mtfCache.set(instId, result);
-      } catch (_) {}
-    }));
-    if (i + 2 < pairs.length) await new Promise(r => setTimeout(r, 2000));
-  }
-}
-
+ 
+ 
 // ── ADX 計算（方案E：市況偵測）───────────────────────
-function calcADX(candles, period = 14) {
-  if (candles.length < period + 2) return 25;
+// ── 趨勢輔助指標（ADX + OBV趨勢 + RSI背離 合併）──────
+function calcTrendSignals(candles) {
+  if (!candles || candles.length < 15) {
+    return { adx: 25, isTrend: false, obvTrend: 'flat', rsiDiv: 'none' };
+  }
+  // ADX
+  const period = 14;
   let plusDM = 0, minusDM = 0, tr = 0;
-  for (let i = 0; i < period; i++) {
+  for (let i = 0; i < Math.min(period, candles.length - 1); i++) {
     const c = candles[i], p = candles[i + 1];
-    const upMove   = c.high - p.high;
-    const downMove = p.low  - c.low;
-    plusDM  += upMove   > downMove && upMove   > 0 ? upMove   : 0;
-    minusDM += downMove > upMove   && downMove > 0 ? downMove : 0;
+    const up = c.high - p.high, dn = p.low - c.low;
+    plusDM  += up > dn && up > 0 ? up : 0;
+    minusDM += dn > up && dn > 0 ? dn : 0;
     tr += Math.max(c.high - c.low, Math.abs(c.high - p.close), Math.abs(c.low - p.close));
   }
-  const plusDI  = tr > 0 ? 100 * plusDM  / tr : 0;
-  const minusDI = tr > 0 ? 100 * minusDM / tr : 0;
-  const dx = (plusDI + minusDI) > 0 ? 100 * Math.abs(plusDI - minusDI) / (plusDI + minusDI) : 0;
-  return dx; // ADX > 25 = 趨勢，≤25 = 震盪
-}
+  const pDI = tr > 0 ? 100 * plusDM / tr : 0;
+  const mDI = tr > 0 ? 100 * minusDM / tr : 0;
+  const adx = (pDI + mDI) > 0 ? 100 * Math.abs(pDI - mDI) / (pDI + mDI) : 25;
  
-// ── OBV 計算（方案D：量價異動）───────────────────────
-function calcOBV(candles) {
-  let obv = 0;
-  for (let i = candles.length - 1; i > 0; i--) {
-    if (candles[i - 1].close > candles[i].close) obv += candles[i - 1].vol;
-    else if (candles[i - 1].close < candles[i].close) obv -= candles[i - 1].vol;
-  }
-  return obv;
-}
+  // OBV 趨勢（近5根 vs 前5根）
+  const obv = (slice) => slice.reduce((s, c, i, a) => {
+    if (i === 0) return s;
+    return s + (a[i-1].close > c.close ? a[i-1].vol : a[i-1].close < c.close ? -a[i-1].vol : 0);
+  }, 0);
+  const obvRecent = obv(candles.slice(0, 6));
+  const obvPrev   = obv(candles.slice(5, 11));
+  const obvTrend  = obvRecent > obvPrev ? 'up' : obvRecent < obvPrev ? 'down' : 'flat';
  
-// OBV 趨勢：最近 5 根 vs 前 5 根
-function calcOBVTrend(candles) {
-  const recent = calcOBV(candles.slice(0, 5));
-  const prev   = calcOBV(candles.slice(5, 10));
-  return recent > prev ? 'up' : recent < prev ? 'down' : 'flat';
-}
- 
-// ── RSI 背離偵測（方案D）────────────────────────────
-function detectRSIDivergence(candles) {
-  if (candles.length < 15) return 'none';
+  // RSI 背離
+  let rsiDiv = 'none';
   const prices = candles.slice(0, 10).map(c => c.close);
-  const rsiArr = candles.slice(0, 10).map((_, i) => calcRSI(candles.slice(i)));
-  const priceDown = prices[0] < prices[4];  // 近期價格創低
-  const rsiUp     = rsiArr[0] > rsiArr[4];  // RSI 未創低（底背離）
-  const priceUp   = prices[0] > prices[4];  // 近期價格創高
-  const rsiDown   = rsiArr[0] < rsiArr[4];  // RSI 未創高（頂背離）
-  if (priceDown && rsiUp)   return 'bullish';  // 底背離 → 做多
-  if (priceUp   && rsiDown) return 'bearish';  // 頂背離 → 做空
-  return 'none';
+  const rsi0 = calcRSI(candles), rsi4 = calcRSI(candles.slice(4));
+  if (prices[0] < prices[4] && rsi0 > rsi4) rsiDiv = 'bullish';
+  else if (prices[0] > prices[4] && rsi0 < rsi4) rsiDiv = 'bearish';
+ 
+  return { adx, isTrend: adx > 25, obvTrend, rsiDiv };
 }
  
 // ── ATR 動態倍數（方案E）────────────────────────────
 function getATRMultiplier(atr, candles) {
-  const avgATR = candles.slice(0, 20).reduce((s, c) => {
-    const p = candles[candles.indexOf(c) + 1];
+  const avgATR = candles.slice(0, 20).reduce((s, c, idx) => {
+    const p = candles[idx + 1];
     if (!p) return s;
     return s + Math.max(c.high - c.low, Math.abs(c.high - p.close), Math.abs(c.low - p.close));
   }, 0) / 20;
@@ -244,36 +222,6 @@ function getATRMultiplier(atr, candles) {
   return 1.5;                            // 正常
 }
  
-// ── 多時框分析（方案C）───────────────────────────────
-async function analyzeMultiTimeframe(instId) {
-  try {
-    const [c4h, c1h] = await Promise.all([
-      fetchCandles(instId, '4H', 30).catch(() => []),
-      fetchCandles(instId, '1H', 30).catch(() => []),
-    ]);
-    if (!c4h.length || !c1h.length) return { mtfDir: 'neutral', mtfBonus: 0 };
-    const ma20_4h  = c4h.slice(0, 20).reduce((s, c) => s + c.close, 0) / Math.min(20, c4h.length);
-    const macd4h   = calcMACD(c4h);
-    const ma20_1h  = c1h.slice(0, 20).reduce((s, c) => s + c.close, 0) / 20;
-    const rsi1h    = calcRSI(c1h);
-    const macd1h   = calcMACD(c1h);
- 
-    const bull4h = c4h[0].close > ma20_4h && macd4h.histogram > 0;
-    const bear4h = c4h[0].close < ma20_4h && macd4h.histogram < 0;
-    // 1H 回調到 MA 附近
-    const pullback1h = Math.abs(c1h[0].close - ma20_1h) / ma20_1h < 0.008;
-    // 1H 反彈確認
-    const bounce1h_long  = rsi1h > 45 && macd1h.histogram > 0 && pullback1h;
-    const bounce1h_short = rsi1h < 55 && macd1h.histogram < 0 && pullback1h;
- 
-    let mtfDir = 'neutral', mtfBonus = 0;
-    if (bull4h && bounce1h_long)  { mtfDir = 'long';  mtfBonus = 15; }
-    if (bear4h && bounce1h_short) { mtfDir = 'short'; mtfBonus = 15; }
-    return { mtfDir, mtfBonus };
-  } catch (e) {
-    return { mtfDir: 'neutral', mtfBonus: 0 };
-  }
-}
  
 // ══════════════════════════════════════════════
 // 1. 動態抓取交易量前10名幣對
@@ -318,7 +266,7 @@ async function updateTopPairs() {
       .slice(0, 30); // 降低候選數量減少API呼叫
  
     const allScored = [];
-    for (let i = 0; i < top60.length; i += 8) {
+    for (let i = 0; i < top60.length; i += 4) {
       const batch = top60.slice(i, i + 4);
       const batchRes = await Promise.allSettled(batch.map(async t => {
         try {
@@ -349,7 +297,7 @@ async function updateTopPairs() {
         } catch (_) { return null; }
       }));
       allScored.push(...batchRes);
-      if (i + 4 < top60.length) await new Promise(r => setTimeout(r, 1500));
+      if (i + 4 < top60.length) await new Promise(r => setTimeout(r, 1500)); // 批次間隔
     }
     const scored = allScored;
  
@@ -395,14 +343,14 @@ const rateLimiter = {
   maxConcurrent: 3,        // 最多 3 個並行請求
   minInterval: 350,        // 每個請求間隔至少 350ms
   lastCallTime: 0,
-
+ 
   async acquire() {
     return new Promise(resolve => {
       this.queue.push(resolve);
       this._next();
     });
   },
-
+ 
   async _next() {
     if (this.running >= this.maxConcurrent || !this.queue.length) return;
     const now = Date.now();
@@ -420,7 +368,7 @@ const rateLimiter = {
     });
   }
 };
-
+ 
 async function fetchWithRetry(url, params, retries = 3) {
   const release = await rateLimiter.acquire();
   try {
@@ -539,10 +487,9 @@ function calc5mFlow(candles5m) {
 async function analyze(instId) {
   // 資金費率從快取讀取
   const side = getSideData(instId);
-
-  // MTF 也從快取讀（在 scanAndPush 前批次計算）
-  const mtf = mtfCache.get(instId) || { mtfDir: 'neutral', mtfBonus: 0 };
-
+ 
+  const mtf = { mtfDir: 'neutral', mtfBonus: 0 }; // MTF 已移除
+ 
   const [candles, candles5m, ticker] = await Promise.all([
     fetchCandles(instId, '1H', 50).catch(() => []),
     fetchCandles5m(instId).catch(() => []),
@@ -576,10 +523,7 @@ async function analyze(instId) {
   const atr    = calcATR(candles);
   const boll   = calcBollinger(candles);
   const flow5m   = calc5mFlow(candles5m);
-  const adx      = calcADX(candles);              // 方案E：市況偵測
-  const obvTrend = calcOBVTrend(candles);         // 方案D：量價異動
-  const rsiDiv   = detectRSIDivergence(candles);  // 方案D：RSI背離
-  const isTrend  = adx > 25;                      // 方案E：趨勢 or 震盪模式
+  const { adx, isTrend, obvTrend, rsiDiv } = calcTrendSignals(candles); // 趨勢輔助指標
  
   const reasons = [];
   let score = 50, dir = 'neutral';
@@ -921,229 +865,7 @@ async function placeSwapOrder(instId, a) {
 // ══════════════════════════════════════════════
 // 指令選單 Flex Message
 // ══════════════════════════════════════════════
-function buildCommandMenu() {
-  const now = new Date().toLocaleString('zh-TW', { timeZone: 'Asia/Taipei', hour12: false });
-  const fuseStatus = dailyStats.isFused ? '🚨 已熔斷' : '✅ 運作中';
-  const btcEmoji   = btcTrend === 'bull' ? '📈' : btcTrend === 'bear' ? '📉' : '⚖️';
  
-  const btnStyle = (bg, label, txt) => ({
-    type: 'box', layout: 'vertical', flex: 1,
-    backgroundColor: bg, cornerRadius: '8px', paddingAll: '10px',
-    action: { type: 'message', label, text: txt },
-    contents: [
-      { type: 'text', text: label, color: '#FFFFFF', size: 'xs', weight: 'bold', align: 'center', wrap: true },
-    ]
-  });
- 
-  return {
-    type: 'flex',
-    altText: '📋 Alice 指令選單',
-    contents: {
-      type: 'bubble', size: 'giga',
-      styles: { body: { backgroundColor: '#0D1117' } },
-      body: {
-        type: 'box', layout: 'vertical', paddingAll: '16px',
-        contents: [
- 
-          // Header
-          {
-            type: 'box', layout: 'horizontal', alignItems: 'center', marginBottom: 'md',
-            contents: [
-              {
-                type: 'box', layout: 'vertical', flex: 1,
-                contents: [
-                  { type: 'text', text: '🔷 Alice 指令中心', color: '#00CFFF', size: 'md', weight: 'bold' },
-                  { type: 'text', text: now, color: '#6B7A99', size: 'xxs' },
-                ]
-              },
-              {
-                type: 'box', layout: 'vertical', alignItems: 'flex-end',
-                contents: [
-                  { type: 'text', text: fuseStatus, color: dailyStats.isFused ? '#FF3C50' : '#00E578', size: 'xs', weight: 'bold' },
-                  { type: 'text', text: `BTC ${btcEmoji} ${btcTrend === 'bull' ? '多頭' : btcTrend === 'bear' ? '空頭' : '中性'}`, color: '#8B949E', size: 'xxs' },
-                ]
-              }
-            ]
-          },
- 
-          { type: 'separator', color: '#21262D', margin: 'md' },
- 
-          // 掃描 & 狀態
-          { type: 'text', text: '📡 掃描 & 監控', color: '#8B949E', size: 'xxs', margin: 'md' },
-          {
-            type: 'box', layout: 'horizontal', spacing: 'sm', margin: 'sm',
-            contents: [
-              btnStyle('#005533', '🔍 立即掃描', '掃描'),
-              btnStyle('#003366', '📊 系統狀態', '狀態'),
-              btnStyle('#222233', '📋 監控幣對', '幣對'),
-            ]
-          },
- 
-          { type: 'separator', color: '#21262D', margin: 'md' },
- 
-          // 市場數據
-          { type: 'text', text: '📈 市場數據查詢', color: '#8B949E', size: 'xxs', margin: 'md' },
-          {
-            type: 'box', layout: 'horizontal', spacing: 'sm', margin: 'sm',
-            contents: [
-            ]
-          },
-          {
-            type: 'box', layout: 'horizontal', spacing: 'sm', margin: 'sm',
-            contents: [
-              {
-                type: 'box', layout: 'vertical', flex: 1,
-                backgroundColor: '#0d1a2e', cornerRadius: '8px', paddingAll: '10px',
-                action: { type: 'message', label: '自訂OI查詢', text: 'OI ' },
-                contents: [
-                  { type: 'text', text: '🔎 OI 自訂幣種', color: '#00CFFF', size: 'xs', align: 'center' },
-                  { type: 'text', text: '輸入：OI 幣種名', color: '#6B7A99', size: 'xxs', align: 'center', margin: 'xs' },
-                ]
-              },
-            ]
-          },
- 
-          { type: 'separator', color: '#21262D', margin: 'md' },
- 
-          // 報告 & 設定
-          { type: 'text', text: '⚙️ 報告 & 設定', color: '#8B949E', size: 'xxs', margin: 'md' },
-          {
-            type: 'box', layout: 'horizontal', spacing: 'sm', margin: 'sm',
-            contents: [
-              btnStyle('#1a0d00', '📊 每日報告', '報告'),
-              btnStyle('#1a0000', '🔓 清除冷卻', '清除冷卻'),
-              btnStyle('#220000', '🚨 重置熔斷', '重置熔斷'),
-            ]
-          },
- 
-          { type: 'separator', color: '#21262D', margin: 'md' },
- 
-          // 監控清單管理
-          { type: 'text', text: '➕ 監控清單管理', color: '#8B949E', size: 'xxs', margin: 'md' },
-          {
-            type: 'box', layout: 'horizontal', spacing: 'sm', margin: 'sm',
-            contents: [
-              {
-                type: 'box', layout: 'vertical', flex: 1,
-                backgroundColor: '#001a33', cornerRadius: '8px', paddingAll: '10px',
-                action: { type: 'message', label: '新增監控', text: '新增監控 ' },
-                contents: [
-                  { type: 'text', text: '➕ 新增幣種', color: '#00CFFF', size: 'xs', align: 'center' },
-                  { type: 'text', text: '輸入：新增監控 BTC', color: '#6B7A99', size: 'xxs', align: 'center', margin: 'xs' },
-                ]
-              },
-              {
-                type: 'box', layout: 'vertical', flex: 1,
-                backgroundColor: '#1a0000', cornerRadius: '8px', paddingAll: '10px',
-                action: { type: 'message', label: '移除監控', text: '移除監控 ' },
-                contents: [
-                  { type: 'text', text: '➖ 移除幣種', color: '#FF3C50', size: 'xs', align: 'center' },
-                  { type: 'text', text: '輸入：移除監控 BTC', color: '#6B7A99', size: 'xxs', align: 'center', margin: 'xs' },
-                ]
-              },
-              {
-                type: 'box', layout: 'vertical', flex: 1,
-                backgroundColor: '#001a00', cornerRadius: '8px', paddingAll: '10px',
-                action: { type: 'message', label: '恢復預設', text: '恢復預設監控' },
-                contents: [
-                  { type: 'text', text: '🔄 恢復預設', color: '#00E578', size: 'xs', align: 'center' },
-                  { type: 'text', text: '重設為預設清單', color: '#6B7A99', size: 'xxs', align: 'center', margin: 'xs' },
-                ]
-              },
-            ]
-          },
- 
-          // 提示
-          {
-            type: 'box', layout: 'vertical', margin: 'lg',
-            backgroundColor: '#0d1520', cornerRadius: '8px', paddingAll: '10px',
-            contents: [
-              { type: 'text', text: '💡 快速輸入指令', color: '#6B7A99', size: 'xxs', weight: 'bold', margin: 'none' },
-              { type: 'text', text: '輸入「?」或「指令」隨時叫出此選單', color: '#6B7A99', size: 'xxs', margin: 'xs', wrap: true },
-            ]
-          },
- 
-        ]
-      }
-    }
-  };
-}
- 
-// ══════════════════════════════════════════════
-// 方案D：每日報告 Flex Message
-// ══════════════════════════════════════════════
-function buildDailyReport() {
-  const total    = dailyStats.signals.length;
-  const topPairs = dailyStats.signals
-    .sort((a, b) => b.score - a.score)
-    .slice(0, 5);
-  const longCount  = dailyStats.signals.filter(s => s.dir === 'long').length;
-  const shortCount = dailyStats.signals.filter(s => s.dir === 'short').length;
-  const avgScore   = total > 0 ? Math.round(dailyStats.signals.reduce((s, x) => s + x.score, 0) / total) : 0;
- 
-  const signalRows = topPairs.map(s => ({
-    type: 'box', layout: 'horizontal', paddingAll: '6px',
-    backgroundColor: '#0d1520', cornerRadius: '5px', margin: 'xs',
-    contents: [
-      { type: 'text', text: s.pair.replace(/-USDT-SWAP$/, ''), color: '#00cfff', size: 'xs', flex: 2 },
-      { type: 'text', text: s.dir === 'long' ? '📈 多' : '📉 空', color: s.dir === 'long' ? '#4ade80' : '#f87171', size: 'xs', flex: 1, align: 'center' },
-      { type: 'text', text: `${s.score}分`, color: s.score >= 80 ? '#ff4466' : '#FFD600', size: 'xs', flex: 1, align: 'end' },
-      { type: 'text', text: s.time, color: '#6b7a99', size: 'xxs', flex: 2, align: 'end' },
-    ]
-  }));
- 
-  return {
-    type: 'flex',
-    altText: `📊 每日報告 ${dailyStats.date}`,
-    contents: {
-      type: 'bubble', size: 'kilo',
-      header: {
-        type: 'box', layout: 'vertical', backgroundColor: '#0a0e1a', paddingAll: '12px',
-        contents: [
-          { type: 'text', text: '📊 Alice 每日報告', color: '#7eb3f7', size: 'sm', weight: 'bold' },
-          { type: 'text', text: dailyStats.date, color: '#6b7a99', size: 'xs' },
-        ]
-      },
-      body: {
-        type: 'box', layout: 'vertical', backgroundColor: '#141824', spacing: 'sm',
-        contents: [
-          // 統計摘要
-          { type: 'box', layout: 'horizontal', spacing: 'sm', contents: [
-            { type: 'box', layout: 'vertical', flex: 1, backgroundColor: '#0d1520', cornerRadius: '8px', paddingAll: '10px', contents: [
-              { type: 'text', text: '訊號總數', color: '#6b7a99', size: 'xxs', align: 'center' },
-              { type: 'text', text: String(total), color: '#00cfff', size: 'xl', weight: 'bold', align: 'center' },
-            ]},
-            { type: 'box', layout: 'vertical', flex: 1, backgroundColor: '#0d1520', cornerRadius: '8px', paddingAll: '10px', contents: [
-              { type: 'text', text: '平均評分', color: '#6b7a99', size: 'xxs', align: 'center' },
-              { type: 'text', text: `${avgScore}分`, color: avgScore >= 75 ? '#4ade80' : '#FFD600', size: 'xl', weight: 'bold', align: 'center' },
-            ]},
-            { type: 'box', layout: 'vertical', flex: 1, backgroundColor: '#0d1520', cornerRadius: '8px', paddingAll: '10px', contents: [
-              { type: 'text', text: '多/空比', color: '#6b7a99', size: 'xxs', align: 'center' },
-              { type: 'text', text: `${longCount}/${shortCount}`, color: '#e8eaf0', size: 'xl', weight: 'bold', align: 'center' },
-            ]},
-          ]},
-          { type: 'separator', color: '#ffffff12', margin: 'md' },
-          { type: 'text', text: '🏆 今日最強訊號', color: '#e8eaf0', size: 'xs', weight: 'bold' },
-          ...(signalRows.length > 0 ? signalRows : [
-            { type: 'text', text: '今日無訊號記錄', color: '#6b7a99', size: 'xs', align: 'center', margin: 'md' }
-          ]),
-          { type: 'separator', color: '#ffffff12', margin: 'md' },
-          { type: 'box', layout: 'horizontal', contents: [
-            { type: 'text', text: `🔴 強訊號（≥80分）：${dailyStats.signals.filter(s=>s.score>=80).length}筆`, color: '#ff4466', size: 'xxs', flex: 1 },
-            { type: 'text', text: `🟡 中訊號（≥${MIN_SCORE}分）：${dailyStats.signals.filter(s=>s.score>=MIN_SCORE&&s.score<80).length}筆`, color: '#FFD600', size: 'xxs', flex: 1, align: 'end' },
-          ]},
-        ]
-      },
-      footer: {
-        type: 'box', layout: 'vertical', backgroundColor: '#0a0e1a',
-        contents: [
-          { type: 'button', style: 'secondary', height: 'sm',
-            action: { type: 'message', label: '🔍 立即掃描', text: '掃描' } },
-        ]
-      }
-    }
-  };
-}
  
 // ══════════════════════════════════════════════
 // 6. LINE 訊號卡
@@ -1167,7 +889,7 @@ function buildSignalCard(pair, a, signalLevel = 'strong') {
  
   return {
     type: 'flex',
-    altText: `${emoji} ${displayPair} ${isLong?'做多':'做空'} 評分${a.score} 現價${fmt(currentPrice)}`,
+    altText: `${emoji} ${displayPair} ${isLong?'做多📈':'做空📉'} 評分${a.score} ${a.isTrend?'趨勢行情':'震盪行情'}`,
     contents: {
       type: 'bubble', size: 'kilo',
       header: {
@@ -1207,7 +929,7 @@ function buildSignalCard(pair, a, signalLevel = 'strong') {
             { type: 'box', layout: 'vertical', alignItems: 'flex-end', contents: [
               { type: 'text', text: '較訊號價', color: '#6b7a99', size: 'xxs' },
               { type: 'text', text: priceDiffStr, color: priceColor, size: 'sm', weight: 'bold' },
-              { type: 'text', text: `RSI ${a.rsi?.toFixed(0)} ADX ${a.adx?.toFixed(0)||'—'} ${a.isTrend?'趨勢':'震盪'} ${a.doubleCapital?'⚡':''}`, color: '#6b7a99', size: 'xxs' },
+              { type: 'text', text: `RSI ${a.rsi?.toFixed(0)} | ADX ${a.adx?.toFixed(0)||'—'} ${a.isTrend?'📊趨勢':'〰️震盪'} | ${a.dir==='long'?'多頭↑':'空頭↓'} ${a.doubleCapital?'⚡':''}`, color: '#6b7a99', size: 'xxs' },
             ]},
           ]},
  
@@ -1302,8 +1024,7 @@ async function scanAndPush() {
  
   // ── 預先批次更新附加資料（OI/LSR/FundRate/MTF）──────
   await refreshSideData(WATCH_PAIRS);
-  await refreshMtfCache(WATCH_PAIRS);
-
+ 
   // ── 分批並行掃描（每批 5 個）────────────────────────
   const BATCH_SIZE = 3; // 降低並行數，配合限速器
   const results = [];
@@ -1429,17 +1150,11 @@ app.post('/webhook', middleware(lineConfig), async (req, res) => {
       const fuseStatus = dailyStats.isFused ? `🚨 已熔斷（今日虧損$${dailyStats.dailyLoss.toFixed(2)}）` : `✅ 正常（今日虧損$${dailyStats.dailyLoss.toFixed(2)}/$${DAILY_MAX_LOSS}）`;
       await client.replyMessage(tok, {
         type: 'text',
-        text: `🤖 Alice 狀態
- 
-` +
-          `🪙 BTC趨勢：${btcTrend === 'bull' ? '📈 多頭' : btcTrend === 'bear' ? '📉 空頭' : '⚖️ 中性'}
-` +
-          `🛡 熔斷狀態：${fuseStatus}
-` +
-          `📊 待確認：${Object.keys(pendingOrders).length} 筆
-` +
-          `🔍 監控：${WATCH_PAIRS.length} 個幣對
-` +
+        text: `🤖 Alice 狀態\n` +
+          `🪙 BTC趨勢：${btcTrend === 'bull' ? '📈 多頭' : btcTrend === 'bear' ? '📉 空頭' : '⚖️ 中性'}\n` +
+          `🛡 熔斷狀態：${fuseStatus}\n` +
+          `📊 待確認：${Object.keys(pendingOrders).length} 筆\n` +
+          `🔍 監控：${WATCH_PAIRS.length} 個幣對\n` +
           `⚡ 門檻：${MIN_SCORE}分 | 止損上限 $${MAX_LOSS_USDT}\n` +
           `💰 本金：$${BASE_CAPITAL}\n` +
           `指令：掃描 / 幣對 / 報告 / 清除冷卻 / 重置熔斷`
@@ -1449,14 +1164,21 @@ app.post('/webhook', middleware(lineConfig), async (req, res) => {
       await client.replyMessage(tok, { type: 'text', text: `📊 監控清單：\n${WATCH_PAIRS.map(p=>p.replace('-USDT-SWAP','')).join('、')}` });
  
     } else if (text === '指令' || text === 'help' || text === '選單' || text === '?') {
-      await client.replyMessage(tok, buildCommandMenu());
+      await client.replyMessage(tok, {
+        type: 'text',
+        text: `🤖 Alice 指令列表\n\n` +
+          `📡 掃描 — 立即掃描訊號\n` +
+          `📊 狀態 — 系統狀態\n` +
+          `💱 幣對 — 監控清單\n` +
+          `✅ 一鍵下單 [幣對] — 確認下單\n` +
+          `❌ 跳過 [幣對] — 略過訊號\n` +
+          `🔄 重置熔斷 — 解除熔斷\n` +
+          `♻️ 清除冷卻 — 重置冷卻`,
+      });
  
     } else if (text === '掃描') {
       await client.replyMessage(tok, { type: 'text', text: '🔍 掃描中…' });
       scanAndPush();
- 
-    } else if (text === '報告' || text === '每日報告') {
-      await client.replyMessage(tok, buildDailyReport());
  
     } else if (text === '清除冷卻' || text === '重置') {
       signalCooldown.clear();
@@ -1466,86 +1188,6 @@ app.post('/webhook', middleware(lineConfig), async (req, res) => {
       dailyStats.isFused = false;
       dailyStats.dailyLoss = 0;
       await client.replyMessage(tok, { type: 'text', text: '✅ 熔斷已手動重置，恢復正常掃描。' });
- 
-    } else if (text.startsWith('新增監控')) {
-      // ── 新增監控幣種：新增監控 BTC / 新增監控 BTC ETH SOL ─
-      const symbols = text.replace('新增監控','').trim().toUpperCase().split(/\s+/).filter(Boolean);
-      if (!symbols.length) {
-        await client.replyMessage(tok, { type: 'text', text: '請輸入幣種\n例：新增監控 BTC\n   新增監控 BTC ETH SOL' });
-        continue;
-      }
-      const added = [], skipped = [];
-      for (const sym of symbols) {
-        const instId = sym.includes('-SWAP') ? sym : `${sym}-USDT-SWAP`;
-        if (WATCH_PAIRS.includes(instId)) { skipped.push(sym); continue; }
-        WATCH_PAIRS.push(instId);
-        added.push(sym);
-      }
-      await client.replyMessage(tok, {
-        type: 'text',
-        text: `✅ 監控清單更新\n\n` +
-          (added.length  ? `➕ 新增：${added.join('、')}\n` : '') +
-          (skipped.length? `⏭️ 已存在：${skipped.join('、')}\n` : '') +
-          `\n目前共監控 ${WATCH_PAIRS.length} 個幣對`,
-      });
- 
-    } else if (text.startsWith('移除監控')) {
-      // ── 移除監控幣種 ────────────────────────────────────
-      const symbols = text.replace('移除監控','').trim().toUpperCase().split(/\s+/).filter(Boolean);
-      if (!symbols.length) {
-        await client.replyMessage(tok, { type: 'text', text: '請輸入幣種\n例：移除監控 ZEC' });
-        continue;
-      }
-      const removed = [], notFound = [];
-      for (const sym of symbols) {
-        const instId = sym.includes('-SWAP') ? sym : `${sym}-USDT-SWAP`;
-        const idx = WATCH_PAIRS.indexOf(instId);
-        if (idx === -1) { notFound.push(sym); continue; }
-        WATCH_PAIRS.splice(idx, 1);
-        removed.push(sym);
-      }
-      await client.replyMessage(tok, {
-        type: 'text',
-        text: `✅ 監控清單更新\n\n` +
-          (removed.length  ? `➖ 移除：${removed.join('、')}\n` : '') +
-          (notFound.length ? `⚠️ 未找到：${notFound.join('、')}\n` : '') +
-          `\n目前共監控 ${WATCH_PAIRS.length} 個幣對`,
-      });
- 
-    } else if (text === '恢復預設監控') {
-      // ── 恢復預設幣種清單 ─────────────────────────────────
-      WATCH_PAIRS.length = 0;
-      FIXED_PAIRS.forEach(p => WATCH_PAIRS.push(p));
-      await client.replyMessage(tok, {
-        type: 'text',
-        text: `🔄 已恢復預設監控清單\n\n${WATCH_PAIRS.map(p=>p.replace('-USDT-SWAP','')).join('、')}`,
-      });
- 
-    } else if (text === '熱榜' || text === '動態清單' || text === '波動榜') {
-      // ── 查看當前動態篩選結果 ─────────────────────────
-      if (!dynamicPairsDetail.length) {
-        await client.replyMessage(tok, { type: 'text', text: '⏳ 動態清單尚未初始化，請稍後或輸入「掃描」觸發更新。' });
-        continue;
-      }
-      const ago = Math.round((Date.now() - dynamicPairsUpdatedAt) / 60000);
-      const lines = dynamicPairsDetail.slice(0, 10).map((t, i) => {
-        const sym = t.instId.replace('-USDT-SWAP','');
-        const chgStr = (t.priceChg * 100).toFixed(1) + '%';
-        return `${i+1}. ${sym}  ATR ${t.atrRatio}x  漲跌${chgStr}  分${t.score}`;
-      }).join('\n');
-      await client.replyMessage(tok, {
-        type: 'text',
-        text: `🔥 高波動幣種榜（${ago}分前更新）\n` +
-          `━━━━━━━━━━━━\n` +
-          lines + '\n' +
-          `━━━━━━━━━━━━\n` +
-          `共監控 ${WATCH_PAIRS.length} 個幣對\n` +
-          `每30分鐘自動更新`,
-      });
- 
-    } else if (text === '設定監控' || text === '監控設定') {
-      // ── 設定監控選單 Flex ────────────────────────────────
-      await client.replyMessage(tok, buildWatchlistFlex());
  
     } else {
       // ── 未知指令 → 提示選單 ──────────────────────────────
@@ -1557,101 +1199,4 @@ app.post('/webhook', middleware(lineConfig), async (req, res) => {
   }
 });
  
-// ── 監控清單 Flex Message ────────────────────────────
-function buildWatchlistFlex() {
-  const items = WATCH_PAIRS.map(p => {
-    const sym = p.replace('-USDT-SWAP','');
-    return {
-      type: 'box', layout: 'horizontal',
-      paddingAll: '8px', backgroundColor: '#161B22',
-      cornerRadius: '6px', margin: 'sm',
-      contents: [
-        { type: 'text', text: sym, color: '#00CFFF', size: 'sm', weight: 'bold', flex: 1 },
-        {
-          type: 'box', layout: 'vertical', flex: 0,
-          backgroundColor: '#330000', cornerRadius: '4px', paddingAll: '4px',
-          action: { type: 'message', label: '移除', text: `移除監控 ${sym}` },
-          contents: [{ type: 'text', text: '✕', color: '#FF3C50', size: 'xxs' }],
-        },
-      ],
-    };
-  });
-  return {
-    type: 'flex',
-    altText: '⚙️ 監控清單設定',
-    contents: {
-      type: 'bubble', size: 'giga',
-      styles: { body: { backgroundColor: '#0D1117' } },
-      body: {
-        type: 'box', layout: 'vertical', paddingAll: '16px',
-        contents: [
-          { type: 'text', text: '⚙️ 監控清單設定', color: '#E6EDF3', size: 'lg', weight: 'bold' },
-          { type: 'text', text: `目前監控 ${WATCH_PAIRS.length} 個幣種`, color: '#8B949E', size: 'xs', margin: 'xs' },
-          { type: 'separator', color: '#21262D', margin: 'md' },
-          ...items,
-          { type: 'separator', color: '#21262D', margin: 'md' },
-          {
-            type: 'box', layout: 'vertical', backgroundColor: '#001833',
-            cornerRadius: '8px', paddingAll: '12px', margin: 'md',
-            contents: [
-              { type: 'text', text: '➕ 新增幣種', color: '#00CFFF', size: 'sm', weight: 'bold' },
-              { type: 'text', text: '輸入：新增監控 BTC\n多個：新增監控 BTC ETH SOL', color: '#8B949E', size: 'xxs', margin: 'sm', wrap: true },
-            ],
-          },
-          {
-            type: 'box', layout: 'vertical', backgroundColor: '#001800',
-            cornerRadius: '8px', paddingAll: '12px', margin: 'sm',
-            action: { type: 'message', label: '恢復預設', text: '恢復預設監控' },
-            contents: [{ type: 'text', text: '🔄 恢復預設清單', color: '#00E578', size: 'sm', align: 'center' }],
-          },
-        ],
-      },
-    },
-  };
-}
  
-// ══════════════════════════════════════════════
-// 9. 定時任務
-// ══════════════════════════════════════════════
-cron.schedule('*/3 * * * *', scanAndPush);
-
-// 每 30 分鐘清除超過 2 小時的過期待確認訂單
-cron.schedule('*/30 * * * *', () => {
-  const expireMs = 2 * 60 * 60 * 1000; // 2 小時
-  const now = Date.now();
-  let cleared = 0;
-  for (const [pair, order] of Object.entries(pendingOrders)) {
-    if (order.createdAt && now - order.createdAt > expireMs) {
-      delete pendingOrders[pair];
-      cleared++;
-    }
-  }
-  if (cleared > 0) console.log(`🧹 清除 ${cleared} 筆過期訂單`);
-});
-cron.schedule('*/30 * * * *', updateTopPairs); // 每30分鐘重新篩選高波動幣種
-cron.schedule('*/15 * * * *', updateBtcTrend);
- 
-// ── 方案D：每天早上 8:00 推送每日報告 ────────
-cron.schedule('0 8 * * *', async () => {
-  try {
-    const report = buildDailyReport();
-    await client.pushMessage(USER_ID, report);
-    // 重置每日統計（含熔斷）
-    dailyStats.wins = 0;
-    dailyStats.losses = 0;
-    dailyStats.totalPnl = 0;
-    dailyStats.signals = [];
-    dailyStats.dailyLoss = 0;
-    dailyStats.isFused = false;
-    dailyStats.date = new Date().toLocaleDateString('zh-TW', { timeZone: 'Asia/Taipei' });
-    console.log('📊 每日報告已推送');
-  } catch (e) { console.error('每日報告推送失敗:', e.message); }
-}, { timezone: 'Asia/Taipei' });
- 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, async () => {
-  console.log(`🚀 Bot 啟動 Port ${PORT}`);
-  await updateTopPairs();
-  await updateBtcTrend();
-  await scanAndPush();
-});
