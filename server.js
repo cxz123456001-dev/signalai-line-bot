@@ -145,6 +145,10 @@ async function getFundRate(instId) {
   } catch (e) { return 0; }
 }
  
+// ── 快取變數宣告 ─────────────────────────────────────
+const sideDataCache = new Map(); // instId → { fundRate, ts }
+const mtfCache      = new Map(); // instId → { mtfDir, mtfBonus }
+
 function getSideData(instId) {
   return sideDataCache.get(instId) || { fundRate: 0 };
 }
