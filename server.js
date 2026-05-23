@@ -332,18 +332,16 @@ async function updateTopPairs() {
           }, 0) / 20;
           const atrRatio = atrAvg > 0 ? atrCurr / atrAvg : 1;
  
-          // 動態評分：ATR × OI × 成交量
+          // 動態評分：ATR + 成交量
           const dynScore =
-            atrRatio * 40 +
-            (oiData.oiRatio > 1.1 ? 30 : 0) +
-            Math.min(t.vol24h / 1e8, 30);
+            atrRatio * 50 +
+            Math.min(t.vol24h / 1e8, 50);
  
           return {
             instId:   t.instId,
             vol24h:   t.vol24h,
             priceChg: t.priceChg,
             atrRatio: atrRatio.toFixed(2),
-            oiRatio:  oiData.oiRatio.toFixed(2),
             score:    parseFloat(dynScore.toFixed(1)),
           };
         } catch (_) { return null; }
