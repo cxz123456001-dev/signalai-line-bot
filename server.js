@@ -58,8 +58,8 @@ function fmtDiff(diff, price) {
  
 // ── 核心必選幣對（流動性佳、技術指標可靠）──────────
 const FIXED_PAIRS = [
-  'BTC-USDT','ETH-USDT','SOL-USDT','ZEC-USDT','BSB-USDT','BILL-USDT',
-  'XRP-USDT','DOGE-USDT','ADA-USDT','EDE-USDT','XAU-USDT','LABU-USDT',
+  'BTC-USDT','ETH-USDT','SOL-USDT',
+  'XRP-USDT','DOGE-USDT','ADA-USDT',
 ];
  
 // ── 動態篩選設定 ─────────────────────────────────────
