@@ -1,7 +1,4 @@
 require('dotenv').config();
-// ── 強制單一 Worker（防止 Render 多實例同時打 API）──
-process.env.WEB_CONCURRENCY = '1';
- 
 const express = require('express');
 const { Client, middleware } = require('@line/bot-sdk');
 const axios = require('axios');
@@ -267,8 +264,8 @@ async function updateTopPairs() {
 const rateLimiter = {
   queue: [],
   running: 0,
-  maxConcurrent: 2,        // 最多 2 個並行請求
-  minInterval: 500,        // 每個請求間隔至少 500ms（更保守）
+  maxConcurrent: 1,        // 單一並行，完全序列化
+  minInterval: 600,        // 每個請求間隔 600ms = 最多 1.6次/秒
   lastCallTime: 0,
  
   async acquire() {
@@ -810,12 +807,15 @@ function buildSignalCard(pair, a, signalLevel = 'strong') {
 }
  
 // ── 掃描推送 ────────────────────────────────────
+let _scanning = false; // 互斥鎖，防止並行掃描
 async function scanAndPush() {
+  if (_scanning) { console.log('⏳ 上次掃描尚未完成，跳過'); return; }
+  _scanning = true;
+  try { await _doScan(); } finally { _scanning = false; }
+}
+async function _doScan() {
   // ── 每日熔斷檢查 ─────────────────────────────────
-  if (dailyStats.isFused) {
-    return;
-    return;
-  }
+  if (dailyStats.isFused) { return; }
  
  
   // ── BTC 市場情緒更新（每10分鐘）──────────────────
@@ -826,9 +826,7 @@ async function scanAndPush() {
   console.log(`[${new Date().toLocaleTimeString('zh-TW', { timeZone: 'Asia/Taipei' })}] 掃描 ${WATCH_PAIRS.length} 個幣對… BTC:${btcTrend}`);
   refreshSideData(WATCH_PAIRS).catch(() => {}); // 背景更新費率快取，不阻塞掃描
  
-  // ── 預先批次更新附加資料（OI/LSR/FundRate/MTF）──────
- 
-  // ── 分批並行掃描（每批 5 個）────────────────────────
+  // ── 分批並行掃描（每批 3 個）────────────────────────
   const BATCH_SIZE = 3; // 降低並行數，配合限速器
   const results = [];
   for (let i = 0; i < WATCH_PAIRS.length; i += BATCH_SIZE) {
@@ -839,7 +837,7 @@ async function scanAndPush() {
     results.push(...batchResults);
     // 批次間休息 1500ms
     if (i + BATCH_SIZE < WATCH_PAIRS.length) {
-      await new Promise(r => setTimeout(r, 3000));
+      await new Promise(r => setTimeout(r, 4000));
     }
   }
  
