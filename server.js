@@ -999,15 +999,14 @@ app.post('/webhook', middleware(lineConfig), async (req, res) => {
       const fuseStatus = dailyStats.isFused ? `🚨 已熔斷（今日虧損$${dailyStats.dailyLoss.toFixed(2)}）` : `✅ 正常（今日虧損$${dailyStats.dailyLoss.toFixed(2)}/$${DAILY_MAX_LOSS}）`;
       await client.replyMessage(tok, {
         type: 'text',
-        text: `🤖 Alice 狀態\n` +
+        text: `🐕 Alice 狀態\n\n` +
           `🪙 BTC趨勢：${btcTrend === 'bull' ? '📈 多頭' : btcTrend === 'bear' ? '📉 空頭' : '⚖️ 中性'}\n` +
           `🛡 熔斷狀態：${fuseStatus}\n` +
-          `📊 待確認：${Object.keys(pendingOrders).length} 筆（含做空）\n` +
+          `📊 待確認：${Object.keys(pendingOrders).length} 筆\n` +
           `🔍 監控：${WATCH_PAIRS.length} 個幣對\n` +
           `⚡ 門檻：${MIN_SCORE}分 | 止損上限 $${MAX_LOSS_USDT}\n` +
-          `💰 本金：$${BASE_CAPITAL}\n` +
-          `📈 今日做多：${dailyStats.signals.filter(s=>s.dir==='long').length} 筆 | 📉 做空：${dailyStats.signals.filter(s=>s.dir==='short').length} 筆\n` +
-          `指令：掃描 / 幣對 / 熱榜 / 清除冷卻 / 重置熔斷`
+          `💰 本金：$${BASE_CAPITAL} | 流動性門檻 ${(DYN_MIN_VOL/1e6).toFixed(0)}M\n\n` +
+          `指令：掃描 / 幣對 / 報告 / 清除冷卻 / 重置熔斷`
       });
  
     } else if (text === '幣對') {
@@ -1027,6 +1026,23 @@ app.post('/webhook', middleware(lineConfig), async (req, res) => {
           `❌ 跳過 [幣對] — 略過訊號\n` +
           `🔄 重置熔斷 — 解除熔斷\n` +
           `♻️ 清除冷卻 — 重置冷卻`,
+      });
+ 
+    } else if (text === '報告') {
+      const long_c = dailyStats.signals.filter(s=>s.dir==='long').length;
+      const short_c = dailyStats.signals.filter(s=>s.dir==='short').length;
+      const total = dailyStats.signals.length;
+      const avgScore = total > 0 ? Math.round(dailyStats.signals.reduce((s,x)=>s+x.score,0)/total) : 0;
+      await client.replyMessage(tok, {
+        type: 'text',
+        text: `📊 Alice 今日報告（${dailyStats.date}）\n\n` +
+          `訊號總數：${total} 筆\n` +
+          `做多：${long_c} 筆  做空：${short_c} 筆\n` +
+          `平均評分：${avgScore} 分\n` +
+          `今日虧損：$${dailyStats.dailyLoss.toFixed(2)}/$${DAILY_MAX_LOSS}\n\n` +
+          (dailyStats.signals.slice(-5).reverse().map(s =>
+            `${s.time} ${s.pair.replace('-USDT-SWAP','').replace('-USDT','')} ${s.dir==='long'?'📈':'📉'} ${s.score}分`
+          ).join('\n') || '今日無訊號')
       });
  
     } else if (text === '掃描') {
