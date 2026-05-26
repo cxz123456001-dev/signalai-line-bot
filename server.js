@@ -1,4 +1,7 @@
 require('dotenv').config();
+// ── 強制單一 Worker（防止 Render 多實例同時打 API）──
+process.env.WEB_CONCURRENCY = '1';
+ 
 const express = require('express');
 const { Client, middleware } = require('@line/bot-sdk');
 const axios = require('axios');
@@ -60,11 +63,10 @@ const FIXED_PAIRS = [
   'XRP-USDT','DOGE-USDT','ADA-USDT',
 ];
  
-// ── 動態篩選設定 ─────────────────────────────────────
-const DYN_MIN_VOL     = parseFloat(process.env.DYN_MIN_VOL    || '30000000'); // 最低 3000 萬 USDT
-const DYN_ATR_MULT    = parseFloat(process.env.DYN_ATR_MULT   || '1.3');  // ATR 需 > 均值 1.3x
-const DYN_PRICE_CHG   = parseFloat(process.env.DYN_PRICE_CHG  || '0.03'); // 24h 漲跌幅下限 3%
-const DYN_PRICE_MAX   = parseFloat(process.env.DYN_PRICE_MAX  || '0.15'); // 24h 漲跌幅上限 15%
+const DYN_MIN_VOL = parseFloat(process.env.DYN_MIN_VOL || '30000000');
+const DYN_ATR_MULT = parseFloat(process.env.DYN_ATR_MULT || '1.3');
+const DYN_PRICE_CHG = parseFloat(process.env.DYN_PRICE_CHG || '0.03');
+const DYN_PRICE_MAX = parseFloat(process.env.DYN_PRICE_MAX || '0.15');
  
 // 動態幣種清單快取
 let dynamicPairs = [];
@@ -77,11 +79,8 @@ const pendingOrders = {};
 // ── 方案B：冷卻機制 ─────────────────────────────────
 const signalCooldown = new Map();
 const COOLDOWN_MS = 30 * 60 * 1000;
-function isOnCooldown(pair) {
-  const last = signalCooldown.get(pair);
-  return last && (Date.now() - last) < COOLDOWN_MS;
-}
-function setCooldown(pair) { signalCooldown.set(pair, Date.now()); }
+const isOnCooldown = pair => { const t = signalCooldown.get(pair); return t && Date.now()-t < COOLDOWN_MS; };
+const setCooldown = pair => signalCooldown.set(pair, Date.now());
  
 // ── 每日績效記錄 ─────────────────────────────────────
 const dailyStats = {
@@ -90,9 +89,7 @@ const dailyStats = {
   isFused: false,
   date: new Date().toLocaleDateString('zh-TW', { timeZone: 'Asia/Taipei' }),
 };
-function recordSignal(pair, score, dir) {
-  dailyStats.signals.push({ pair, score, dir, time: new Date().toLocaleTimeString('zh-TW', { timeZone: 'Asia/Taipei' }) });
-}
+const recordSignal = (pair, score, dir) => dailyStats.signals.push({ pair, score, dir, time: new Date().toLocaleTimeString('zh-TW', { timeZone: 'Asia/Taipei' }) });
 function addDailyLoss(amount) {
   dailyStats.dailyLoss += amount;
   if (!dailyStats.isFused && dailyStats.dailyLoss >= DAILY_MAX_LOSS) {
@@ -100,12 +97,7 @@ function addDailyLoss(amount) {
     console.warn(`🔴 每日虧損熔斷觸發！今日虧損 $${dailyStats.dailyLoss.toFixed(2)}，停止交易`);
     client.pushMessage(USER_ID, {
       type: 'text',
-      text: `🚨 熔斷警告
- 
-今日累計虧損已達 $${dailyStats.dailyLoss.toFixed(2)}（上限 $${DAILY_MAX_LOSS}）
- 
-⛔ 今日剩餘時間停止推送訊號
-明日 08:00 自動重置`,
+      text: `🚨 熔斷警告\n\n今日累計虧損已達 $${dailyStats.dailyLoss.toFixed(2)}（上限 $${DAILY_MAX_LOSS}）\n\n⛔ 今日剩餘時間停止推送訊號\n明日 08:00 自動重置`,
     }).catch(()=>{});
   }
 }
@@ -147,9 +139,7 @@ async function getFundRate(instId) {
 const sideDataCache = new Map(); // instId → { fundRate, ts }
 const mtfCache      = new Map(); // instId → { mtfDir, mtfBonus }
  
-function getSideData(instId) {
-  return sideDataCache.get(instId) || { fundRate: 0 };
-}
+const getSideData = instId => sideDataCache.get(instId) || { fundRate: 0 };
  
 async function refreshSideData(pairs) {
   console.log(`🔄 批次更新 ${pairs.length} 個幣種資金費率...`);
@@ -208,14 +198,8 @@ function calcTrendSignals(candles) {
  
 // ── ATR 動態倍數（方案E）────────────────────────────
 function getATRMultiplier(atr, candles) {
-  const avgATR = candles.slice(0, 20).reduce((s, c, idx) => {
-    const p = candles[idx + 1];
-    if (!p) return s;
-    return s + Math.max(c.high - c.low, Math.abs(c.high - p.close), Math.abs(c.low - p.close));
-  }, 0) / 20;
-  if (atr < avgATR * 0.7) return 1.2;   // 低波動：止損緊一點
-  if (atr > avgATR * 1.5) return 2.0;   // 高波動：止損寬一點
-  return 1.5;                            // 正常
+  const avg = candles.slice(0,20).reduce((s,c,i)=>{const p=candles[i+1]; return p?s+Math.max(c.high-c.low,Math.abs(c.high-p.close),Math.abs(c.low-p.close)):s;},0)/20;
+  return atr < avg*0.7 ? 1.2 : atr > avg*1.5 ? 2.0 : 1.5;
 }
  
  
@@ -283,8 +267,8 @@ async function updateTopPairs() {
 const rateLimiter = {
   queue: [],
   running: 0,
-  maxConcurrent: 3,        // 最多 3 個並行請求
-  minInterval: 350,        // 每個請求間隔至少 350ms
+  maxConcurrent: 2,        // 最多 2 個並行請求
+  minInterval: 500,        // 每個請求間隔至少 500ms（更保守）
   lastCallTime: 0,
  
   async acquire() {
@@ -322,7 +306,7 @@ async function fetchWithRetry(url, params, retries = 3) {
       } catch (e) {
         const status = e.response?.status;
         if (status === 429) {
-          const wait = (i + 1) * 3000;
+          const wait = (i + 1) * 5000; // 5/10/15 秒
           console.warn(`⏳ 429 速率限制，${wait/1000}s 後重試 (${i+1}/${retries})...`);
           await new Promise(r => setTimeout(r, wait));
         } else if (i === retries - 1) {
@@ -361,31 +345,21 @@ async function fetchTicker(instId) {
 // ══════════════════════════════════════════════
 function calcRSI(candles, period = 14) {
   if (candles.length < period + 1) return 50;
-  let gains = 0, losses = 0;
+  let g = 0, l = 0;
   for (let i = 1; i <= period; i++) {
-    const diff = candles[i - 1].close - candles[i].close;
-    if (diff > 0) gains += diff; else losses -= diff;
+    const d = candles[i-1].close - candles[i].close;
+    if (d > 0) g += d; else l -= d;
   }
-  const avgGain = gains / period;
-  const avgLoss = losses / period;
-  if (avgLoss === 0) return 100;
-  const rs = avgGain / avgLoss;
-  return 100 - (100 / (1 + rs));
+  if (l === 0) return 100;
+  return 100 - 100 / (1 + g / l);
 }
  
 function calcMACD(candles) {
-  const closes = candles.map(c => c.close).reverse();
-  const ema = (data, period) => {
-    const k = 2 / (period + 1);
-    let emaVal = data[0];
-    for (let i = 1; i < data.length; i++) emaVal = data[i] * k + emaVal * (1 - k);
-    return emaVal;
-  };
-  const ema12 = ema(closes, 12);
-  const ema26 = ema(closes, 26);
-  const macdLine = ema12 - ema26;
-  const signal = ema(closes.slice(-9), 9);
-  return { macd: macdLine, signal, histogram: macdLine - signal };
+  const c = candles.map(x => x.close).reverse();
+  const ema = (d, p) => { const k = 2/(p+1); let e = d[0]; for (let i=1;i<d.length;i++) e=d[i]*k+e*(1-k); return e; };
+  const m = ema(c,12) - ema(c,26);
+  const s = ema(c.slice(-9), 9);
+  return { macd: m, signal: s, histogram: m - s };
 }
  
 function calcATR(candles, period = 14) {
@@ -405,26 +379,18 @@ function calcBollinger(candles, period = 20) {
 }
  
 function calc5mFlow(candles5m) {
-  if (!candles5m || candles5m.length < 5) {
-    return { bullRatio: 0.5, bearRatio: 0.5, volSurge: 1, avgVol: 0 };
-  }
-  const recent = candles5m.slice(0, 5);
-  const bullVol = recent.filter(c => c.close > c.open).reduce((s, c) => s + c.vol, 0);
-  const bearVol = recent.filter(c => c.close <= c.open).reduce((s, c) => s + c.vol, 0);
-  const total = bullVol + bearVol;
-  const bullRatio = total > 0 ? bullVol / total : 0.5;
-  const avgVol = recent.reduce((s, c) => s + c.vol, 0) / recent.length;
-  const prev = candles5m.slice(5, 10);
-  const prevAvg = (prev.length && avgVol > 0) ? prev.reduce((s, c) => s + c.vol, 0) / prev.length : avgVol || 1;
-  const volSurge = prevAvg > 0 ? avgVol / prevAvg : 1;
-  return { bullRatio, bearRatio: 1 - bullRatio, volSurge, avgVol };
+  if (!candles5m || candles5m.length < 5) return { bullRatio: 0.5, bearRatio: 0.5, volSurge: 1, avgVol: 0 };
+  const r = candles5m.slice(0, 5);
+  const bv = r.filter(c=>c.close>c.open).reduce((s,c)=>s+c.vol,0);
+  const tot = r.reduce((s,c)=>s+c.vol,0);
+  const bullRatio = tot > 0 ? bv/tot : 0.5;
+  const avgVol = tot / r.length;
+  const prev = candles5m.slice(5,10);
+  const prevAvg = prev.length ? prev.reduce((s,c)=>s+c.vol,0)/prev.length : avgVol||1;
+  return { bullRatio, bearRatio: 1-bullRatio, volSurge: prevAvg>0?avgVol/prevAvg:1, avgVol };
 }
  
-// ══════════════════════════════════════════════
-// 5. 綜合分析
-// ══════════════════════════════════════════════
-// 做多評分函式
-// ══════════════════════════════════════════════
+// ── 做多評分 ───────────────────────────────────
 function scoreLong(reasons, score, p) {
   const { last, resistance, support, rsi, macd, boll, ma10, ma20, ma50, flow5m, volRatio, isCandle_bull, bodyRatio, mtf, obvTrend, rsiDiv, isTrend } = p;
   if (last.close > resistance && volRatio > 1.2) {
@@ -459,9 +425,7 @@ function scoreLong(reasons, score, p) {
   return score;
 }
  
-// ══════════════════════════════════════════════
-// 做空評分函式
-// ══════════════════════════════════════════════
+// ── 做空評分 ───────────────────────────────────
 function scoreShort(reasons, score, p) {
   const { last, support, rsi, macd, boll, ma10, ma20, ma50, flow5m, volRatio, isCandle_bull, bodyRatio, mtf, obvTrend, rsiDiv, isTrend } = p;
   if (last.close < support && volRatio > 1.2) {
@@ -636,15 +600,10 @@ async function analyze(instId) {
 }
  
  
-// ══════════════════════════════════════════════
-// OKX 合約下單（簽名 + API）
-// ══════════════════════════════════════════════
+// ── OKX 下單 ────────────────────────────────────
 const crypto = require('crypto');
  
-function okxSign(timestamp, method, path, body = '') {
-  const msg = timestamp + method + path + body;
-  return crypto.createHmac('sha256', OKX_SECRET).update(msg).digest('base64');
-}
+function okxSign(ts, method, path, body='') { return crypto.createHmac('sha256',OKX_SECRET).update(ts+method+path+body).digest('base64'); }
  
 function okxHeaders(method, path, body = '') {
   const ts = new Date().toISOString().replace(/\.\d{3}Z$/, '.000Z');
@@ -727,9 +686,7 @@ async function placeSwapOrder(instId, a) {
 // ══════════════════════════════════════════════
  
  
-// ══════════════════════════════════════════════
-// 6. LINE 訊號卡
-// ══════════════════════════════════════════════
+// ── 訊號卡 ─────────────────────────────────────
 function buildSignalCard(pair, a, signalLevel = 'strong') {
   const isLong  = a.dir === 'long';
   const isStrong = signalLevel === 'strong';
@@ -852,13 +809,11 @@ function buildSignalCard(pair, a, signalLevel = 'strong') {
   };
 }
  
-// ══════════════════════════════════════════════
-// 7. 掃描推送
-// ══════════════════════════════════════════════
+// ── 掃描推送 ────────────────────────────────────
 async function scanAndPush() {
   // ── 每日熔斷檢查 ─────────────────────────────────
   if (dailyStats.isFused) {
-    console.log('⛔ 今日已熔斷，跳過掃描');
+    return;
     return;
   }
  
@@ -884,7 +839,7 @@ async function scanAndPush() {
     results.push(...batchResults);
     // 批次間休息 1500ms
     if (i + BATCH_SIZE < WATCH_PAIRS.length) {
-      await new Promise(r => setTimeout(r, 2000));
+      await new Promise(r => setTimeout(r, 3000));
     }
   }
  
@@ -897,28 +852,23 @@ async function scanAndPush() {
       // ── Phase1：BTC 情緒過濾（寬鬆版）──────────────
       // BTC空頭 → 禁多頭；BTC多頭 → 禁空頭；中性 → 兩邊都允許
       if (a.dir === 'long'  && btcTrend === 'bear' && a.score < 80) {
-        console.log(`🐻 BTC空頭且評分<80，跳過 ${pair} 做多`);
         continue;
       }
       if (a.dir === 'short' && btcTrend === 'bull' && a.score < 80) {
-        console.log(`🐂 BTC多頭且評分<80，跳過 ${pair} 做空`);
         continue;
       }
  
       // ── Phase2：資金費率（有訊號才查，按需呼叫）──
       const fundRateNow = await getFundRate(toSwap(pair)).catch(() => 0);
       if (a.dir === 'long'  && fundRateNow >  FUND_RATE_LIMIT) {
-        console.log(`💸 ${pair} 費率過高(${(fundRateNow*100).toFixed(4)}%)，跳過`);
         continue;
       }
       if (a.dir === 'short' && fundRateNow < -FUND_RATE_LIMIT) {
-        console.log(`💸 ${pair} 費率過負(${(fundRateNow*100).toFixed(4)}%)，跳過`);
         continue;
       }
  
       // ── 方案B：冷卻機制 ───────────────────────────
       if (isOnCooldown(pair)) {
-        console.log(`⏸ ${pair} 冷卻中，跳過`);
         continue;
       }
  
@@ -942,9 +892,7 @@ async function scanAndPush() {
   }
 }
  
-// ══════════════════════════════════════════════
-// 8. Webhook
-// ══════════════════════════════════════════════
+// ── Webhook ────────────────────────────────────
 app.post('/webhook', middleware(lineConfig), async (req, res) => {
   res.sendStatus(200);
   for (const event of req.body.events) {
@@ -954,7 +902,6 @@ app.post('/webhook', middleware(lineConfig), async (req, res) => {
  
     if (text === 'myid') {
       await client.replyMessage(tok, { type: 'text', text: `你的 ID：\n${event.source.userId}` });
- 
     } else if (text.startsWith('一鍵下單')) {
       const pair = text.replace('一鍵下單','').trim();
       const o = pendingOrders[pair];
@@ -989,12 +936,10 @@ app.post('/webhook', middleware(lineConfig), async (req, res) => {
           `💸 手續費：$${a.fee}`,
       });
       delete pendingOrders[pair];
- 
     } else if (text.startsWith('跳過')) {
       const pair = text.replace('跳過','').trim();
       delete pendingOrders[pair];
       await client.replyMessage(tok, { type: 'text', text: `⏭️ 已跳過 ${pair.replace('-','/')}。` });
- 
     } else if (text === '狀態') {
       const fuseStatus = dailyStats.isFused ? `🚨 已熔斷（今日虧損$${dailyStats.dailyLoss.toFixed(2)}）` : `✅ 正常（今日虧損$${dailyStats.dailyLoss.toFixed(2)}/$${DAILY_MAX_LOSS}）`;
       await client.replyMessage(tok, {
@@ -1008,10 +953,8 @@ app.post('/webhook', middleware(lineConfig), async (req, res) => {
           `💰 本金：$${BASE_CAPITAL} | 流動性門檻 ${(DYN_MIN_VOL/1e6).toFixed(0)}M\n\n` +
           `指令：掃描 / 幣對 / 報告 / 清除冷卻 / 重置熔斷`
       });
- 
     } else if (text === '幣對') {
       await client.replyMessage(tok, { type: 'text', text: `📊 監控清單：\n${WATCH_PAIRS.map(p=>p.replace('-USDT-SWAP','')).join('、')}` });
- 
     } else if (text === '指令' || text === 'help' || text === '選單' || text === '?') {
       await client.replyMessage(tok, {
         type: 'text',
@@ -1027,7 +970,6 @@ app.post('/webhook', middleware(lineConfig), async (req, res) => {
           `🔄 重置熔斷 — 解除熔斷\n` +
           `♻️ 清除冷卻 — 重置冷卻`,
       });
- 
     } else if (text === '報告') {
       const long_c = dailyStats.signals.filter(s=>s.dir==='long').length;
       const short_c = dailyStats.signals.filter(s=>s.dir==='short').length;
@@ -1044,20 +986,16 @@ app.post('/webhook', middleware(lineConfig), async (req, res) => {
             `${s.time} ${s.pair.replace('-USDT-SWAP','').replace('-USDT','')} ${s.dir==='long'?'📈':'📉'} ${s.score}分`
           ).join('\n') || '今日無訊號')
       });
- 
     } else if (text === '掃描') {
       await client.replyMessage(tok, { type: 'text', text: '🔍 掃描中…' });
       scanAndPush();
- 
     } else if (text === '清除冷卻' || text === '重置') {
       signalCooldown.clear();
       await client.replyMessage(tok, { type: 'text', text: '✅ 已清除所有幣種冷卻，下次掃描將重新評估。' });
- 
     } else if (text === '重置熔斷') {
       dailyStats.isFused = false;
       dailyStats.dailyLoss = 0;
       await client.replyMessage(tok, { type: 'text', text: '✅ 熔斷已手動重置，恢復正常掃描。' });
- 
     } else if (text === '熱榜' || text === '動態清單' || text === '波動榜') {
       const ago = dynamicPairsUpdatedAt ? Math.round((Date.now() - dynamicPairsUpdatedAt) / 60000) : null;
       if (!dynamicPairsDetail.length) {
@@ -1074,7 +1012,6 @@ app.post('/webhook', middleware(lineConfig), async (req, res) => {
         type: 'text',
         text: `🔥 高波動榜${ago !== null ? `（${ago}分前更新）` : ''}\n━━━━━━━━━━━━\n${lines}\n━━━━━━━━━━━━\n共監控 ${WATCH_PAIRS.length} 個幣對`,
       });
- 
     } else if (text.startsWith('新增 ') || text.startsWith('新增監控 ')) {
       const input = text.replace(/^(新增監控?)\s+/, '').toUpperCase();
       const symbols = input.split(/\s+/).filter(Boolean);
@@ -1092,7 +1029,6 @@ app.post('/webhook', middleware(lineConfig), async (req, res) => {
           (exists.length ? `⏭️ 已存在：${exists.join('、')}\n` : '') +
           `共 ${WATCH_PAIRS.length} 個幣對`,
       });
- 
     } else if (text.startsWith('移除 ') || text.startsWith('移除監控 ')) {
       const input = text.replace(/^(移除監控?)\s+/, '').toUpperCase();
       const symbols = input.split(/\s+/).filter(Boolean);
