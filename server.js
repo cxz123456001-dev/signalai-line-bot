@@ -1105,26 +1105,20 @@ cron.schedule('0 0 * * *', () => {
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
   console.log(`🚀 Alice Bot 啟動 Port ${PORT}`);
-  await updateTopPairs();
-  await updateBtcTrend();
-  await scanAndPush();
  
-  // Keep-alive：每 8 分鐘 ping 自己
+  // Keep-alive 先啟動
   if (RENDER_URL) {
     setInterval(async () => {
       try {
         const res = await axios.get(`${RENDER_URL}/ping`, { timeout: 10000 });
         console.log(`💓 Keep-alive ping OK (${res.status})`);
-      } catch (e) {
-        console.warn(`⚠️ Keep-alive ping 失敗: ${e.message}`);
-      }
+      } catch (e) { console.warn(`⚠️ Keep-alive ping 失敗: ${e.message}`); }
     }, 8 * 60 * 1000);
     console.log(`💓 Keep-alive 已啟動 → ${RENDER_URL}/ping`);
   }
  
-  // Watchdog：14 分鐘無掃描自動觸發
+  // Watchdog
   let lastCronAt = Date.now();
-  const _origScan = scanAndPush;
   setInterval(() => {
     const elapsed = (Date.now() - lastCronAt) / 1000;
     if (elapsed > 14 * 60) {
@@ -1134,5 +1128,18 @@ app.listen(PORT, async () => {
     }
   }, 60 * 1000);
   console.log('🐕 Watchdog 已啟動');
+ 
+  // 分散啟動：每個步驟間隔 5 秒，避免瞬間爆量
+  setTimeout(async () => {
+    try { await updateBtcTrend(); } catch(e) {}
+  }, 2000);
+ 
+  setTimeout(async () => {
+    try { await updateTopPairs(); } catch(e) {}
+  }, 8000);
+ 
+  setTimeout(async () => {
+    try { await scanAndPush(); } catch(e) {}
+  }, 20000); // 啟動 20 秒後才開始第一次掃描
 });
  
