@@ -461,27 +461,6 @@ function calc5mFlow(candles5m) {
   const candleRange   = last.high - last.low;
   const bodyRatio     = candleRange > 0 ? candleBody / candleRange : 0;
  
-  // ── 方向預判（多空信號各自計分）────────────────
-  let longPts = 0, shortPts = 0;
-  if (last.close > resistance && volRatio > 1.2)           longPts  += 4;
-  if (last.close < support    && volRatio > 1.2)           shortPts += 4;
-  if (last.close < support * 1.005 && last.close > support * 0.995) longPts += 2;
-  if (rsi < 40)  longPts  += 3;
-  if (rsi > 60)  shortPts += 3;
-  if (macd.histogram > 0 && macd.macd > macd.signal)      longPts  += 2;
-  if (macd.histogram < 0 && macd.macd < macd.signal)      shortPts += 2;
-  if (ma10 > ma20 && ma20 > ma50)                          longPts  += 2;
-  if (ma10 < ma20 && ma20 < ma50)                          shortPts += 2;
-  if (flow5m.bullRatio > 0.6)                              longPts  += 2;
-  if (flow5m.bullRatio < 0.4)                              shortPts += 2;
-  if (isCandle_bull && bodyRatio > 0.5)                    longPts  += 1;
-  if (!isCandle_bull && bodyRatio > 0.5)                   shortPts += 1;
-  if (last.close > boll.upper)                             longPts  += 1;
-  if (last.close < boll.lower)                             shortPts += 1;
- 
-  if      (longPts  >= shortPts + 3) dir = 'long';
-  else if (shortPts >= longPts  + 3) dir = 'short';
- 
   // ══════════════════════════════════════════════
   // 評分計算（呼叫獨立函式）
   // ══════════════════════════════════════════════
