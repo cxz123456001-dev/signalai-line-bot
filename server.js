@@ -60,15 +60,6 @@ const FIXED_PAIRS = [
   'XRP-USDT','DOGE-USDT','ADA-USDT',
 ];
  
-const DYN_MIN_VOL = parseFloat(process.env.DYN_MIN_VOL || '30000000');
-const DYN_ATR_MULT = parseFloat(process.env.DYN_ATR_MULT || '1.3');
-const DYN_PRICE_CHG = parseFloat(process.env.DYN_PRICE_CHG || '0.03');
-const DYN_PRICE_MAX = parseFloat(process.env.DYN_PRICE_MAX || '0.15');
- 
-// 動態幣種清單快取
-let dynamicPairs = [];
-let dynamicPairsUpdatedAt = 0;
-let dynamicPairsDetail = []; // 篩選結果詳細資訊（供報告用）
  
 let WATCH_PAIRS = [...FIXED_PAIRS];
 const pendingOrders = {};
@@ -132,28 +123,7 @@ async function getFundRate(instId) {
   } catch (e) { return 0; }
 }
  
-// ── 快取變數宣告 ─────────────────────────────────────
-const sideDataCache = new Map(); // instId → { fundRate, ts }
-const mtfCache      = new Map(); // instId → { mtfDir, mtfBonus }
- 
-const getSideData = instId => sideDataCache.get(instId) || { fundRate: 0 };
- 
-async function refreshSideData(pairs) {
-  console.log(`🔄 批次更新 ${pairs.length} 個幣種資金費率...`);
-  for (let i = 0; i < pairs.length; i += 5) {
-    const batch = pairs.slice(i, i + 5);
-    await Promise.allSettled(batch.map(async instId => {
-      try {
-        const swapId = instId.endsWith('-SWAP') ? instId : instId + '-SWAP';
-        const fr = await getFundRate(swapId);
-        sideDataCache.set(instId, { fundRate: fr, ts: Date.now() });
-      } catch (_) {}
-    }));
-    if (i + 5 < pairs.length) await new Promise(r => setTimeout(r, 800));
-  }
-  console.log(`✅ 資金費率快取更新完成`);
-}
- 
+
 // ── ADX 計算（方案E：市況偵測）───────────────────────
 // ── 趨勢輔助指標（ADX + OBV趨勢 + RSI背離 合併）──────
 function calcTrendSignals(candles) {
@@ -173,7 +143,7 @@ function calcTrendSignals(candles) {
   const pDI = tr > 0 ? 100 * plusDM / tr : 0;
   const mDI = tr > 0 ? 100 * minusDM / tr : 0;
   const adx = (pDI + mDI) > 0 ? 100 * Math.abs(pDI - mDI) / (pDI + mDI) : 25;
- 
+
   // OBV 趨勢（近5根 vs 前5根）
   const obv = (slice) => slice.reduce((s, c, i, a) => {
     if (i === 0) return s;
@@ -182,14 +152,14 @@ function calcTrendSignals(candles) {
   const obvRecent = obv(candles.slice(0, 6));
   const obvPrev   = obv(candles.slice(5, 11));
   const obvTrend  = obvRecent > obvPrev ? 'up' : obvRecent < obvPrev ? 'down' : 'flat';
- 
+
   // RSI 背離
   let rsiDiv = 'none';
   const prices = candles.slice(0, 10).map(c => c.close);
   const rsi0 = calcRSI(candles), rsi4 = calcRSI(candles.slice(4));
   if (prices[0] < prices[4] && rsi0 > rsi4) rsiDiv = 'bullish';
   else if (prices[0] > prices[4] && rsi0 < rsi4) rsiDiv = 'bearish';
- 
+
   return { adx, isTrend: adx > 25, obvTrend, rsiDiv };
 }
  
@@ -200,59 +170,9 @@ function getATRMultiplier(atr, candles) {
 }
  
  
-// ══════════════════════════════════════════════
-// 1. 動態抓取交易量前10名幣對
-// ══════════════════════════════════════════════
-// 動態高波動篩選系統
-// 條件：ATR高 + 成交量大 + OI增加 + 24h漲幅適中
-// ══════════════════════════════════════════════════════
-async function updateTopPairs() {
-  try {
-    const { data } = await axios.get('https://www.okx.com/api/v5/market/tickers', {
-      params: { instType: 'SWAP' }, timeout: 10000,
-    });
- 
-    const stableCoins = ['USDT','USDC','DAI','BUSD','TUSD','USDP','FDUSD','USDD'];
-    const blacklist   = ['LABU','BILL','BSB','XAC','ZEC'];
- 
-    const candidates = data.data
-      .filter(t => t.instId.endsWith('-USDT-SWAP'))
-      .filter(t => !stableCoins.some(s => t.instId.startsWith(s)))
-      .filter(t => !blacklist.some(b => t.instId.startsWith(b)))
-      .filter(t => parseFloat(t.volCcy24h) >= DYN_MIN_VOL)
-      .map(t => {
-        const vol    = parseFloat(t.volCcy24h);
-        const chg    = Math.abs(parseFloat(t.chgUtc0 || t.change24h || 0));
-        const high   = parseFloat(t.high24h || t.last);
-        const low    = parseFloat(t.low24h  || t.last);
-        const last   = parseFloat(t.last);
-        // 振幅比（high-low/last）= 真實波動率，不需要 K 線
-        const amplitude = last > 0 ? (high - low) / last : 0;
-        // 綜合評分：成交量（權重40%）× 漲跌幅（30%）× 振幅（30%）
-        const score = (vol / 1e9) * 0.4 + chg * 100 * 0.3 + amplitude * 100 * 0.3;
-        return { instId: t.instId, vol, chg, amplitude, score };
-      })
-      .filter(t => t.chg >= DYN_PRICE_CHG && t.chg <= DYN_PRICE_MAX)
-      .sort((a, b) => b.score - a.score)
-      .slice(0, parseInt(process.env.DYN_TOP_N || '10'));
- 
-    if (!candidates.length) {
-      console.warn('⚠️ 無符合條件幣種，保持現有清單');
-      return;
-    }
- 
-    dynamicPairs = candidates.map(t => t.instId.replace('-USDT-SWAP', '-USDT'));
-    dynamicPairsDetail = candidates;
-    dynamicPairsUpdatedAt = Date.now();
- 
-    WATCH_PAIRS = [...new Set([...FIXED_PAIRS, ...dynamicPairs])];
-    console.log(`🔥 篩選完成 Top3：${candidates.slice(0,3).map(t =>
-      t.instId.replace('-USDT-SWAP','') + `(${(t.chg*100).toFixed(1)}%振幅${(t.amplitude*100).toFixed(1)}%)`
-    ).join(' | ')}`);
-    console.log(`📊 監控清單（${WATCH_PAIRS.length} 個）：${WATCH_PAIRS.map(p => p.replace('-USDT','')).join(' ')}`);
-  } catch (e) {
-    console.error('更新幣對失敗:', e.message);
-  }
+// ── 監控清單（固定，不打 API）────────────────────
+function updateTopPairs() {
+  console.log(`📊 監控：${WATCH_PAIRS.map(p=>p.replace('-USDT','')).join(' ')}`);
 }
  
 // ══════════════════════════════════════════════
@@ -267,14 +187,14 @@ const rateLimiter = {
   maxConcurrent: 1,        // 單一並行，完全序列化
   minInterval: 600,        // 每個請求間隔 600ms = 最多 1.6次/秒
   lastCallTime: 0,
- 
+
   async acquire() {
     return new Promise(resolve => {
       this.queue.push(resolve);
       this._next();
     });
   },
- 
+
   async _next() {
     if (this.running >= this.maxConcurrent || !this.queue.length) return;
     const now = Date.now();
@@ -292,7 +212,7 @@ const rateLimiter = {
     });
   }
 };
- 
+
 async function fetchWithRetry(url, params, retries = 3) {
   const release = await rateLimiter.acquire();
   try {
@@ -421,7 +341,7 @@ function scoreLong(reasons, score, p) {
   else         { if (rsi < 35) score += 6; }
   return score;
 }
- 
+
 // ── 做空評分 ───────────────────────────────────
 function scoreShort(reasons, score, p) {
   const { last, support, rsi, macd, boll, ma10, ma20, ma50, flow5m, volRatio, isCandle_bull, bodyRatio, mtf, obvTrend, rsiDiv, isTrend } = p;
@@ -453,13 +373,10 @@ function scoreShort(reasons, score, p) {
   else         { if (rsi > 65) score += 6; }
   return score;
 }
- 
+
 async function analyze(instId) {
-  // 資金費率從快取讀取
-  const side = getSideData(instId);
- 
   const mtf = { mtfDir: 'neutral', mtfBonus: 0 }; // MTF 已移除
- 
+
   const [candles, candles5m, ticker] = await Promise.all([
     fetchCandles(instId, '1H', 50).catch(() => []),
     fetchCandles5m(instId).catch(() => []),
@@ -824,7 +741,6 @@ async function _doScan() {
   }
  
   console.log(`[${new Date().toLocaleTimeString('zh-TW', { timeZone: 'Asia/Taipei' })}] 掃描 ${WATCH_PAIRS.length} 個幣對… BTC:${btcTrend}`);
-  refreshSideData(WATCH_PAIRS).catch(() => {}); // 背景更新費率快取，不阻塞掃描
  
   // ── 分批並行掃描（每批 3 個）────────────────────────
   const BATCH_SIZE = 3; // 降低並行數，配合限速器
@@ -908,16 +824,16 @@ app.post('/webhook', middleware(lineConfig), async (req, res) => {
       const isLong = a.dir === 'long';
       const displayPair = pair.replace(/-USDT-SWAP$/, '').replace(/-USDT$/, '').replace('-', '/') + '/USDT';
       const instId = pair.endsWith('-SWAP') ? pair : pair.replace(/-USDT$/, '') + '-USDT-SWAP';
- 
+
       // 先回覆「下單中」
       await client.replyMessage(tok, {
         type: 'text',
         text: `⏳ ${isLong ? '做多📈' : '做空📉'} 下單中...\n${displayPair} ${a.leverage}x 槓桿\n進場 ${fmt(a.entry)} | 止損 ${fmt(a.sl)}`,
       });
- 
+
       // 自動下單到 OKX（做多/做空均支援）
       const orderResult = await placeSwapOrder(instId, a);
- 
+
       // 推送結果
       await client.pushMessage(USER_ID, {
         type: 'text',
@@ -948,7 +864,7 @@ app.post('/webhook', middleware(lineConfig), async (req, res) => {
           `📊 待確認：${Object.keys(pendingOrders).length} 筆\n` +
           `🔍 監控：${WATCH_PAIRS.length} 個幣對\n` +
           `⚡ 門檻：${MIN_SCORE}分 | 止損上限 $${MAX_LOSS_USDT}\n` +
-          `💰 本金：$${BASE_CAPITAL} | 流動性門檻 ${(DYN_MIN_VOL/1e6).toFixed(0)}M\n\n` +
+          `💰 本金：$${BASE_CAPITAL}\n\n` +
           `指令：掃描 / 幣對 / 報告 / 清除冷卻 / 重置熔斷`
       });
     } else if (text === '幣對') {
@@ -960,7 +876,6 @@ app.post('/webhook', middleware(lineConfig), async (req, res) => {
           `📡 掃描 — 立即掃描訊號\n` +
           `📊 狀態 — 系統狀態\n` +
           `💱 幣對 — 監控清單\n` +
-          `🔥 熱榜 — 高波動幣種榜\n` +
           `➕ 新增 BTC — 加入監控\n` +
           `➖ 移除 BTC — 移除監控\n` +
           `✅ 一鍵下單 [幣對] — 自動下單\n` +
@@ -995,20 +910,11 @@ app.post('/webhook', middleware(lineConfig), async (req, res) => {
       dailyStats.dailyLoss = 0;
       await client.replyMessage(tok, { type: 'text', text: '✅ 熔斷已手動重置，恢復正常掃描。' });
     } else if (text === '熱榜' || text === '動態清單' || text === '波動榜') {
-      const ago = dynamicPairsUpdatedAt ? Math.round((Date.now() - dynamicPairsUpdatedAt) / 60000) : null;
-      if (!dynamicPairsDetail.length) {
-        await client.replyMessage(tok, { type: 'text', text: '⏳ 熱榜尚未初始化，請稍後。' });
-        continue;
-      }
-      const lines = dynamicPairsDetail.slice(0, 10).map((t, i) => {
-        const sym = t.instId.replace('-USDT-SWAP','');
-        const chg = (t.chg * 100).toFixed(1);
-        const amp = (t.amplitude * 100).toFixed(1);
-        return `${i+1}. ${sym}  漲跌${chg}%  振幅${amp}%`;
-      }).join('\n');
       await client.replyMessage(tok, {
         type: 'text',
-        text: `🔥 高波動榜${ago !== null ? `（${ago}分前更新）` : ''}\n━━━━━━━━━━━━\n${lines}\n━━━━━━━━━━━━\n共監控 ${WATCH_PAIRS.length} 個幣對`,
+        text: `📊 監控清單\n━━━━━━━━━━━━\n` +
+          WATCH_PAIRS.map((p,i) => `${i+1}. ${p.replace('-USDT','')}`).join('\n') +
+          `\n━━━━━━━━━━━━\n共 ${WATCH_PAIRS.length} 個幣對`,
       });
     } else if (text.startsWith('新增 ') || text.startsWith('新增監控 ')) {
       const input = text.replace(/^(新增監控?)\s+/, '').toUpperCase();
@@ -1045,7 +951,7 @@ app.post('/webhook', middleware(lineConfig), async (req, res) => {
           (notFound.length ? `⚠️ 未找到：${notFound.join('、')}\n` : '') +
           `共 ${WATCH_PAIRS.length} 個幣對`,
       });
- 
+
     } else {
       await client.replyMessage(tok, {
         type: 'text',
@@ -1055,7 +961,7 @@ app.post('/webhook', middleware(lineConfig), async (req, res) => {
   }
 });
  
- 
+
 // ══════════════════════════════════════════════
 // Keep-Alive：防止 Render 免費方案休眠
 // ══════════════════════════════════════════════
@@ -1068,14 +974,13 @@ app.get('/health', (req, res) => res.json({
   pending: Object.keys(pendingOrders ?? {}).length,
   time: new Date().toLocaleString('zh-TW', { timeZone: 'Asia/Taipei' }),
 }));
- 
+
 // ══════════════════════════════════════════════
 // 定時任務
 // ══════════════════════════════════════════════
 cron.schedule('*/3 * * * *', scanAndPush);
-cron.schedule('0 * * * *', updateTopPairs); // 每小時更新前10幣種
 cron.schedule('*/15 * * * *', updateBtcTrend);
- 
+
 // 每 30 分鐘清除超過 2 小時的過期待確認訂單
 cron.schedule('*/30 * * * *', () => {
   const expireMs = 2 * 60 * 60 * 1000;
@@ -1089,7 +994,7 @@ cron.schedule('*/30 * * * *', () => {
   }
   if (cleared > 0) console.log(`🧹 清除 ${cleared} 筆過期訂單`);
 });
- 
+
 // 每天 00:00 重置每日統計與熔斷
 cron.schedule('0 0 * * *', () => {
   dailyStats.dailyLoss = 0;
@@ -1098,14 +1003,14 @@ cron.schedule('0 0 * * *', () => {
   dailyStats.date      = new Date().toLocaleDateString('zh-TW', { timeZone: 'Asia/Taipei' });
   console.log('🔄 每日統計重置完成');
 }, { timezone: 'Asia/Taipei' });
- 
+
 // ══════════════════════════════════════════════
 // 啟動
 // ══════════════════════════════════════════════
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
   console.log(`🚀 Alice Bot 啟動 Port ${PORT}`);
- 
+
   // Keep-alive 先啟動
   if (RENDER_URL) {
     setInterval(async () => {
@@ -1116,7 +1021,7 @@ app.listen(PORT, async () => {
     }, 8 * 60 * 1000);
     console.log(`💓 Keep-alive 已啟動 → ${RENDER_URL}/ping`);
   }
- 
+
   // Watchdog
   let lastCronAt = Date.now();
   setInterval(() => {
@@ -1128,18 +1033,15 @@ app.listen(PORT, async () => {
     }
   }, 60 * 1000);
   console.log('🐕 Watchdog 已啟動');
- 
+
   // 分散啟動：每個步驟間隔 5 秒，避免瞬間爆量
   setTimeout(async () => {
     try { await updateBtcTrend(); } catch(e) {}
   }, 2000);
- 
-  setTimeout(async () => {
-    try { await updateTopPairs(); } catch(e) {}
-  }, 8000);
- 
+
+  setTimeout(() => { updateTopPairs(); }, 8000);
+
   setTimeout(async () => {
     try { await scanAndPush(); } catch(e) {}
   }, 20000); // 啟動 20 秒後才開始第一次掃描
 });
- 
