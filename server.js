@@ -1,6 +1,10 @@
 require('dotenv').config();
 process.env.TZ = 'Asia/Taipei'; // 強制台北時間
  
+// ── 防止多實例：用環境變數標記（Render 同一 dyno 不同 process）
+const INSTANCE_ID = process.env.RENDER_INSTANCE_ID || process.pid.toString();
+console.log(`🔖 實例 ID: ${INSTANCE_ID} PID: ${process.pid}`);
+ 
 const express = require('express');
 const { Client, middleware } = require('@line/bot-sdk');
 const axios = require('axios');
@@ -65,6 +69,20 @@ const FIXED_PAIRS = [
  
 let WATCH_PAIRS = [...FIXED_PAIRS];
 const pendingOrders = {};
+const recentPushes = new Map(); // pair → { dir, entry, ts } 防重複推送
+ 
+function isDuplicatePush(pair, a) {
+  const key = pair;
+  const last = recentPushes.get(key);
+  if (!last) return false;
+  const sameDir = last.dir === a.dir;
+  const sameEntry = Math.abs(last.entry - a.entry) / a.entry < 0.002; // 價格差 < 0.2%
+  const fresh = Date.now() - last.ts < 10 * 60 * 1000; // 10分鐘內
+  return sameDir && sameEntry && fresh;
+}
+function markPushed(pair, a) {
+  recentPushes.set(pair, { dir: a.dir, entry: a.entry, ts: Date.now() });
+}
  
 // ── 方案B：冷卻機制 ─────────────────────────────────
 const signalCooldown = new Map();
@@ -817,16 +835,20 @@ async function _doScan() {
  
       // ── 方案C：訊號強度分級推送 ───────────────────
       if (a.score >= 80) {
+        if (isDuplicatePush(pair, a)) { console.log(`⏭ 重複訊號略過 ${pair}`); continue; }
         const msg = buildTextSignal(pair, a, '🔴 強訊號');
         await client.pushMessage(USER_ID, { type: 'text', text: msg });
+        markPushed(pair, a);
         pendingOrders[pair] = { pair, analysis: a, createdAt: Date.now() };
         setCooldown(pair);
         recordSignal(pair, a.score, a.dir);
         console.log(`🔴 強訊號推送：${pair} 評分${a.score}`);
         await new Promise(r => setTimeout(r, 500));
       } else if (a.score >= MIN_SCORE) {
+        if (isDuplicatePush(pair, a)) { console.log(`⏭ 重複訊號略過 ${pair}`); continue; }
         const msg = buildTextSignal(pair, a, '🟡 中訊號');
         await client.pushMessage(USER_ID, { type: 'text', text: msg });
+        markPushed(pair, a);
         pendingOrders[pair] = { pair, analysis: a, createdAt: Date.now() };
         setCooldown(pair);
         recordSignal(pair, a.score, a.dir);
@@ -836,11 +858,14 @@ async function _doScan() {
         recordSignal(pair, a.score, a.dir);
       }
     } catch (e) {
-      if (e.response?.status === 429) {
-        console.warn(`⚠️ LINE 推送頻率限制 ${pair}，等 3 秒後繼續`);
-        await new Promise(r => setTimeout(r, 3000));
+      const status = e.response?.status;
+      if (status === 429) {
+        console.warn(`⚠️ LINE 429 頻率限制 ${pair}，等 5 秒`);
+        await new Promise(r => setTimeout(r, 5000));
+      } else if (status === 400) {
+        console.error(`❌ LINE 400 訊息格式錯誤 ${pair}:`, e.response?.data?.message || e.message);
       } else {
-        console.error(`❌ LINE 推送失敗 ${pair}:`, e.message);
+        console.error(`❌ LINE 推送失敗 ${pair} [${status||'?'}]:`, e.message);
       }
     }
   }
