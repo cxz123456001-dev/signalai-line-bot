@@ -1,4 +1,6 @@
 require('dotenv').config();
+process.env.TZ = 'Asia/Taipei'; // 強制台北時間
+ 
 const express = require('express');
 const { Client, middleware } = require('@line/bot-sdk');
 const axios = require('axios');
@@ -86,7 +88,7 @@ function addDailyLoss(amount) {
     client.pushMessage(USER_ID, {
       type: 'text',
       text: `🚨 熔斷警告\n\n今日累計虧損已達 $${dailyStats.dailyLoss.toFixed(2)}（上限 $${DAILY_MAX_LOSS}）\n\n⛔ 今日剩餘時間停止推送訊號\n明日 08:00 自動重置`,
-    }).catch(()=>{});
+    }).catch(e => console.warn('熔斷推送失敗:', e.message));
   }
 }
  
@@ -744,10 +746,6 @@ async function _doScan() {
   if (dailyStats.isFused) { return; }
  
  
-  // ── BTC 市場情緒更新（每10分鐘）──────────────────
-  if (Date.now() - btcTrendUpdatedAt > 10 * 60 * 1000) {
-    await updateBtcTrend();
-  }
  
   console.log(`[${new Date().toLocaleTimeString('zh-TW', { timeZone: 'Asia/Taipei' })}] 掃描 ${WATCH_PAIRS.length} 個幣對… BTC:${btcTrend}`);
  
@@ -799,16 +797,25 @@ async function _doScan() {
         setCooldown(pair);
         recordSignal(pair, a.score, a.dir);
         console.log(`🔴 強訊號推送：${pair} 評分${a.score} ADX${a.adx?.toFixed(0)} MTF:${a.mtfDir}`);
+        await new Promise(r => setTimeout(r, 1000)); // LINE 推送間隔
       } else if (a.score >= MIN_SCORE) {
         await client.pushMessage(USER_ID, buildSignalCard(pair, a, 'watch'));
         pendingOrders[pair] = { pair, analysis: a, createdAt: Date.now() };
         setCooldown(pair);
         recordSignal(pair, a.score, a.dir);
         console.log(`🟡 中訊號推送：${pair} 評分${a.score}`);
+        await new Promise(r => setTimeout(r, 1000)); // LINE 推送間隔
       } else if (a.score >= 50) {
         recordSignal(pair, a.score, a.dir);
       }
-    } catch (e) { console.error(`❌ 推送失敗 ${pair}:`, e.message); }
+    } catch (e) {
+      if (e.response?.status === 429) {
+        console.warn(`⚠️ LINE 推送頻率限制 ${pair}，等 3 秒後繼續`);
+        await new Promise(r => setTimeout(r, 3000));
+      } else {
+        console.error(`❌ LINE 推送失敗 ${pair}:`, e.message);
+      }
+    }
   }
 }
  
@@ -985,8 +992,7 @@ app.get('/health', (req, res) => res.json({
 // 定時任務
 // ══════════════════════════════════════════════
 cron.schedule('*/3 * * * *', scanAndPush);
-cron.schedule('*/15 * * * *', () => updateBtcTrend().catch(()=>{}));
-cron.schedule('*/15 * * * *', updateBtcTrend);
+cron.schedule('*/15 * * * *', () => updateBtcTrend().catch(()=>{})); // BTC趨勢每15分鐘
  
 // 每 30 分鐘清除超過 2 小時的過期待確認訂單
 cron.schedule('*/30 * * * *', () => {
