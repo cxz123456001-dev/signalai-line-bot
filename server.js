@@ -632,27 +632,33 @@ async function placeSwapOrder(instId, a) {
 // ── 訊號卡 ─────────────────────────────────────
 // ── 純文字訊號（輕量版，避免 LINE Flex 限速）─────────
 function buildTextSignal(pair, a, badge) {
-  const isLong = a.dir === 'long';
-  const sym = pair.replace(/-USDT-SWAP$/, '').replace(/-USDT$/, '');
-  const dir = isLong ? '做多 📈' : '做空 📉';
-  const good = a.reasons.filter(r => r.ok).map(r => r.t).join(' · ');
-  const bad  = a.reasons.filter(r => !r.ok).map(r => r.t).join(' · ');
-  return (
-    `${badge} ${sym}/${dir}  評分${a.score}\n` +
-    `━━━━━━━━━━━━\n` +
-    `💹 現價：${fmt(a.currentPrice || a.entry)}\n` +
-    `🟢 進場：${fmt(a.entry)}  ⚡${a.leverage}x\n` +
-    `🛑 止損：${fmt(a.sl)}（-$${a.slAmount}）\n` +
-    `━━━━━━━━━━━━\n` +
-    `🎯 TP1：${fmt(a.tp1)}（+$${a.tp1Amount}）\n` +
-    `🎯 TP2：${fmt(a.tp2)}（+$${a.tp2Amount}）\n` +
-    `🎯 TP3：${fmt(a.tp3)}（+$${a.tp3Amount}）\n` +
-    `━━━━━━━━━━━━\n` +
-    `✅ ${good}\n` +
-    (bad ? `❌ ${bad}\n` : '') +
-    `💰 本金$${a.capital}  倉位$${a.positionSize}\n` +
-    `\n輸入「一鍵下單 ${pair}」下單`
-  );
+  try {
+    const isLong = a.dir === 'long';
+    const sym = pair.replace(/-USDT-SWAP$/, '').replace(/-USDT$/, '');
+    const dir = isLong ? '做多 📈' : '做空 📉';
+    const good = (a.reasons || []).filter(r => r.ok).map(r => r.t).join(' · ') || '—';
+    const bad  = (a.reasons || []).filter(r => !r.ok).map(r => r.t).join(' · ');
+    const price = a.currentPrice || a.entry || 0;
+    return (
+      `${badge} ${sym} ${dir}  評分${a.score}\n` +
+      `━━━━━━━━━━━━\n` +
+      `💹 現價：${fmt(price)}\n` +
+      `🟢 進場：${fmt(a.entry||0)}  ⚡${a.leverage||1}x\n` +
+      `🛑 止損：${fmt(a.sl||0)}（-$${a.slAmount||0}）\n` +
+      `━━━━━━━━━━━━\n` +
+      `🎯 TP1：${fmt(a.tp1||0)}（+$${a.tp1Amount||0}）\n` +
+      `🎯 TP2：${fmt(a.tp2||0)}（+$${a.tp2Amount||0}）\n` +
+      `🎯 TP3：${fmt(a.tp3||0)}（+$${a.tp3Amount||0}）\n` +
+      `━━━━━━━━━━━━\n` +
+      `✅ ${good}\n` +
+      (bad ? `❌ ${bad}\n` : '') +
+      `💰 $${a.capital||100}本金  $${a.positionSize||0}倉位\n` +
+      `\n回覆「一鍵下單 ${pair}」執行`
+    );
+  } catch (err) {
+    console.error('buildTextSignal 錯誤:', err.message, JSON.stringify(a).slice(0,200));
+    return `${badge} ${pair} 訊號（格式錯誤，請查看 log）`;
+  }
 }
  
 function buildSignalCard(pair, a, signalLevel = 'strong') {
@@ -837,6 +843,8 @@ async function _doScan() {
       if (a.score >= 80) {
         if (isDuplicatePush(pair, a)) { console.log(`⏭ 重複訊號略過 ${pair}`); continue; }
         const msg = buildTextSignal(pair, a, '🔴 強訊號');
+        if (!msg || msg.length < 10) { console.error(`❌ 訊息為空 ${pair}`); continue; }
+        console.log(`📤 推送中 ${pair}（${msg.length}字）`);
         await client.pushMessage(USER_ID, { type: 'text', text: msg });
         markPushed(pair, a);
         pendingOrders[pair] = { pair, analysis: a, createdAt: Date.now() };
@@ -847,6 +855,8 @@ async function _doScan() {
       } else if (a.score >= MIN_SCORE) {
         if (isDuplicatePush(pair, a)) { console.log(`⏭ 重複訊號略過 ${pair}`); continue; }
         const msg = buildTextSignal(pair, a, '🟡 中訊號');
+        if (!msg || msg.length < 10) { console.error(`❌ 訊息為空 ${pair}`); continue; }
+        console.log(`📤 推送中 ${pair}（${msg.length}字）`);
         await client.pushMessage(USER_ID, { type: 'text', text: msg });
         markPushed(pair, a);
         pendingOrders[pair] = { pair, analysis: a, createdAt: Date.now() };
@@ -859,13 +869,16 @@ async function _doScan() {
       }
     } catch (e) {
       const status = e.response?.status;
+      const errBody = JSON.stringify(e.response?.data || {}).slice(0, 100);
       if (status === 429) {
-        console.warn(`⚠️ LINE 429 頻率限制 ${pair}，等 5 秒`);
+        console.warn(`⚠️ LINE 429 ${pair}，等 5 秒`);
         await new Promise(r => setTimeout(r, 5000));
       } else if (status === 400) {
-        console.error(`❌ LINE 400 訊息格式錯誤 ${pair}:`, e.response?.data?.message || e.message);
+        console.error(`❌ LINE 400 格式錯誤 ${pair}: ${errBody}`);
+      } else if (!status) {
+        console.error(`❌ LINE 網路錯誤 ${pair}: ${e.message} (code:${e.code||'?'})`);
       } else {
-        console.error(`❌ LINE 推送失敗 ${pair} [${status||'?'}]:`, e.message);
+        console.error(`❌ LINE [${status}] ${pair}: ${errBody || e.message}`);
       }
     }
   }
