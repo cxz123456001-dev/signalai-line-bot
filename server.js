@@ -123,7 +123,7 @@ async function getFundRate(instId) {
   } catch (e) { return 0; }
 }
  
-
+ 
 // ── ADX 計算（方案E：市況偵測）───────────────────────
 // ── 趨勢輔助指標（ADX + OBV趨勢 + RSI背離 合併）──────
 function calcTrendSignals(candles) {
@@ -143,7 +143,7 @@ function calcTrendSignals(candles) {
   const pDI = tr > 0 ? 100 * plusDM / tr : 0;
   const mDI = tr > 0 ? 100 * minusDM / tr : 0;
   const adx = (pDI + mDI) > 0 ? 100 * Math.abs(pDI - mDI) / (pDI + mDI) : 25;
-
+ 
   // OBV 趨勢（近5根 vs 前5根）
   const obv = (slice) => slice.reduce((s, c, i, a) => {
     if (i === 0) return s;
@@ -152,14 +152,14 @@ function calcTrendSignals(candles) {
   const obvRecent = obv(candles.slice(0, 6));
   const obvPrev   = obv(candles.slice(5, 11));
   const obvTrend  = obvRecent > obvPrev ? 'up' : obvRecent < obvPrev ? 'down' : 'flat';
-
+ 
   // RSI 背離
   let rsiDiv = 'none';
   const prices = candles.slice(0, 10).map(c => c.close);
   const rsi0 = calcRSI(candles), rsi4 = calcRSI(candles.slice(4));
   if (prices[0] < prices[4] && rsi0 > rsi4) rsiDiv = 'bullish';
   else if (prices[0] > prices[4] && rsi0 < rsi4) rsiDiv = 'bearish';
-
+ 
   return { adx, isTrend: adx > 25, obvTrend, rsiDiv };
 }
  
@@ -184,17 +184,17 @@ function updateTopPairs() {
 const rateLimiter = {
   queue: [],
   running: 0,
-  maxConcurrent: 1,        // 單一並行，完全序列化
-  minInterval: 600,        // 每個請求間隔 600ms = 最多 1.6次/秒
+  maxConcurrent: 1,        // 單一並行
+  minInterval: 800,        // 每個請求間隔 800ms = 最多 1.25次/秒
   lastCallTime: 0,
-
+ 
   async acquire() {
     return new Promise(resolve => {
       this.queue.push(resolve);
       this._next();
     });
   },
-
+ 
   async _next() {
     if (this.running >= this.maxConcurrent || !this.queue.length) return;
     const now = Date.now();
@@ -212,7 +212,7 @@ const rateLimiter = {
     });
   }
 };
-
+ 
 async function fetchWithRetry(url, params, retries = 3) {
   const release = await rateLimiter.acquire();
   try {
@@ -223,7 +223,7 @@ async function fetchWithRetry(url, params, retries = 3) {
       } catch (e) {
         const status = e.response?.status;
         if (status === 429) {
-          const wait = (i + 1) * 5000; // 5/10/15 秒
+          const wait = (i + 1) * 3000; // 3/6/9 秒
           console.warn(`⏳ 429 速率限制，${wait/1000}s 後重試 (${i+1}/${retries})...`);
           await new Promise(r => setTimeout(r, wait));
         } else if (i === retries - 1) {
@@ -341,7 +341,7 @@ function scoreLong(reasons, score, p) {
   else         { if (rsi < 35) score += 6; }
   return score;
 }
-
+ 
 // ── 做空評分 ───────────────────────────────────
 function scoreShort(reasons, score, p) {
   const { last, support, rsi, macd, boll, ma10, ma20, ma50, flow5m, volRatio, isCandle_bull, bodyRatio, mtf, obvTrend, rsiDiv, isTrend } = p;
@@ -373,10 +373,10 @@ function scoreShort(reasons, score, p) {
   else         { if (rsi > 65) score += 6; }
   return score;
 }
-
+ 
 async function analyze(instId) {
   const mtf = { mtfDir: 'neutral', mtfBonus: 0 }; // MTF 已移除
-
+ 
   const [candles, candles5m, ticker] = await Promise.all([
     fetchCandles(instId, '1H', 50).catch(() => []),
     fetchCandles5m(instId).catch(() => []),
@@ -742,18 +742,15 @@ async function _doScan() {
  
   console.log(`[${new Date().toLocaleTimeString('zh-TW', { timeZone: 'Asia/Taipei' })}] 掃描 ${WATCH_PAIRS.length} 個幣對… BTC:${btcTrend}`);
  
-  // ── 分批並行掃描（每批 3 個）────────────────────────
-  const BATCH_SIZE = 3; // 降低並行數，配合限速器
+  // ── 完全序列掃描（每次一個幣，避免 429）────────────
   const results = [];
-  for (let i = 0; i < WATCH_PAIRS.length; i += BATCH_SIZE) {
-    const batch = WATCH_PAIRS.slice(i, i + BATCH_SIZE);
-    const batchResults = await Promise.allSettled(
-      batch.map(pair => analyze(pair).then(a => ({ pair, a })))
-    );
-    results.push(...batchResults);
-    // 批次間休息 1500ms
-    if (i + BATCH_SIZE < WATCH_PAIRS.length) {
-      await new Promise(r => setTimeout(r, 4000));
+  for (let i = 0; i < WATCH_PAIRS.length; i++) {
+    const pair = WATCH_PAIRS[i];
+    const r = await analyze(pair).then(a => ({ pair, a })).catch(e => ({ status:'rejected', reason:e }));
+    results.push({ status: 'fulfilled', value: r });
+    // 每幣掃完後休息 2 秒（3次API × 800ms + 緩衝）
+    if (i < WATCH_PAIRS.length - 1) {
+      await new Promise(r => setTimeout(r, 2000));
     }
   }
  
@@ -824,16 +821,16 @@ app.post('/webhook', middleware(lineConfig), async (req, res) => {
       const isLong = a.dir === 'long';
       const displayPair = pair.replace(/-USDT-SWAP$/, '').replace(/-USDT$/, '').replace('-', '/') + '/USDT';
       const instId = pair.endsWith('-SWAP') ? pair : pair.replace(/-USDT$/, '') + '-USDT-SWAP';
-
+ 
       // 先回覆「下單中」
       await client.replyMessage(tok, {
         type: 'text',
         text: `⏳ ${isLong ? '做多📈' : '做空📉'} 下單中...\n${displayPair} ${a.leverage}x 槓桿\n進場 ${fmt(a.entry)} | 止損 ${fmt(a.sl)}`,
       });
-
+ 
       // 自動下單到 OKX（做多/做空均支援）
       const orderResult = await placeSwapOrder(instId, a);
-
+ 
       // 推送結果
       await client.pushMessage(USER_ID, {
         type: 'text',
@@ -951,7 +948,7 @@ app.post('/webhook', middleware(lineConfig), async (req, res) => {
           (notFound.length ? `⚠️ 未找到：${notFound.join('、')}\n` : '') +
           `共 ${WATCH_PAIRS.length} 個幣對`,
       });
-
+ 
     } else {
       await client.replyMessage(tok, {
         type: 'text',
@@ -961,7 +958,7 @@ app.post('/webhook', middleware(lineConfig), async (req, res) => {
   }
 });
  
-
+ 
 // ══════════════════════════════════════════════
 // Keep-Alive：防止 Render 免費方案休眠
 // ══════════════════════════════════════════════
@@ -974,13 +971,14 @@ app.get('/health', (req, res) => res.json({
   pending: Object.keys(pendingOrders ?? {}).length,
   time: new Date().toLocaleString('zh-TW', { timeZone: 'Asia/Taipei' }),
 }));
-
+ 
 // ══════════════════════════════════════════════
 // 定時任務
 // ══════════════════════════════════════════════
 cron.schedule('*/3 * * * *', scanAndPush);
+cron.schedule('*/10 * * * *', () => updateBtcTrend().catch(()=>{})); // BTC趨勢獨立排程
 cron.schedule('*/15 * * * *', updateBtcTrend);
-
+ 
 // 每 30 分鐘清除超過 2 小時的過期待確認訂單
 cron.schedule('*/30 * * * *', () => {
   const expireMs = 2 * 60 * 60 * 1000;
@@ -994,7 +992,7 @@ cron.schedule('*/30 * * * *', () => {
   }
   if (cleared > 0) console.log(`🧹 清除 ${cleared} 筆過期訂單`);
 });
-
+ 
 // 每天 00:00 重置每日統計與熔斷
 cron.schedule('0 0 * * *', () => {
   dailyStats.dailyLoss = 0;
@@ -1003,14 +1001,14 @@ cron.schedule('0 0 * * *', () => {
   dailyStats.date      = new Date().toLocaleDateString('zh-TW', { timeZone: 'Asia/Taipei' });
   console.log('🔄 每日統計重置完成');
 }, { timezone: 'Asia/Taipei' });
-
+ 
 // ══════════════════════════════════════════════
 // 啟動
 // ══════════════════════════════════════════════
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
   console.log(`🚀 Alice Bot 啟動 Port ${PORT}`);
-
+ 
   // Keep-alive 先啟動
   if (RENDER_URL) {
     setInterval(async () => {
@@ -1021,7 +1019,7 @@ app.listen(PORT, async () => {
     }, 8 * 60 * 1000);
     console.log(`💓 Keep-alive 已啟動 → ${RENDER_URL}/ping`);
   }
-
+ 
   // Watchdog
   let lastCronAt = Date.now();
   setInterval(() => {
@@ -1033,15 +1031,16 @@ app.listen(PORT, async () => {
     }
   }, 60 * 1000);
   console.log('🐕 Watchdog 已啟動');
-
+ 
   // 分散啟動：每個步驟間隔 5 秒，避免瞬間爆量
   setTimeout(async () => {
     try { await updateBtcTrend(); } catch(e) {}
   }, 2000);
-
+ 
   setTimeout(() => { updateTopPairs(); }, 8000);
-
+ 
   setTimeout(async () => {
     try { await scanAndPush(); } catch(e) {}
   }, 20000); // 啟動 20 秒後才開始第一次掃描
 });
+ 
