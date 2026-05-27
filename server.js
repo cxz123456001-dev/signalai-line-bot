@@ -54,11 +54,7 @@ function fmt(price) {
   if (price === null || price === undefined) return '—';
   return price.toFixed(getDecimals(price));
 }
-function fmtDiff(diff, price) {
-  const d = getDecimals(price);
-  const str = diff.toFixed(d);
-  return diff >= 0 ? '+' + str : str;
-}
+const fmtDiff = (d, p) => (d == null ? '—' : (d >= 0 ? '+' : '') + d.toFixed(getDecimals(p)));
  
 // ── 核心必選幣對（流動性佳、技術指標可靠）──────────
 const FIXED_PAIRS = [
@@ -71,18 +67,14 @@ let WATCH_PAIRS = [...FIXED_PAIRS];
 const pendingOrders = {};
 const recentPushes = new Map(); // pair → { dir, entry, ts } 防重複推送
  
-function isDuplicatePush(pair, a) {
-  const key = pair;
-  const last = recentPushes.get(key);
+const isDuplicatePush = (pair, a) => {
+  const last = recentPushes.get(pair);
   if (!last) return false;
-  const sameDir = last.dir === a.dir;
-  const sameEntry = Math.abs(last.entry - a.entry) / a.entry < 0.002; // 價格差 < 0.2%
-  const fresh = Date.now() - last.ts < 10 * 60 * 1000; // 10分鐘內
-  return sameDir && sameEntry && fresh;
-}
-function markPushed(pair, a) {
-  recentPushes.set(pair, { dir: a.dir, entry: a.entry, ts: Date.now() });
-}
+  return last.dir === a.dir
+    && Math.abs(last.entry - a.entry) / a.entry < 0.002
+    && Date.now() - last.ts < 10 * 60 * 1000;
+};
+const markPushed = (pair, a) => recentPushes.set(pair, { dir: a.dir, entry: a.entry, ts: Date.now() });
  
 // ── 方案B：冷卻機制 ─────────────────────────────────
 const signalCooldown = new Map();
@@ -102,11 +94,9 @@ function addDailyLoss(amount) {
   dailyStats.dailyLoss += amount;
   if (!dailyStats.isFused && dailyStats.dailyLoss >= DAILY_MAX_LOSS) {
     dailyStats.isFused = true;
-    console.warn(`🔴 每日虧損熔斷觸發！今日虧損 $${dailyStats.dailyLoss.toFixed(2)}，停止交易`);
-    client.pushMessage(USER_ID, {
-      type: 'text',
-      text: `🚨 熔斷警告\n\n今日累計虧損已達 $${dailyStats.dailyLoss.toFixed(2)}（上限 $${DAILY_MAX_LOSS}）\n\n⛔ 今日剩餘時間停止推送訊號\n明日 08:00 自動重置`,
-    }).catch(e => console.warn('熔斷推送失敗:', e.message));
+    const text = `🚨 熔斷\n今日虧損 $${dailyStats.dailyLoss.toFixed(2)}（上限 $${DAILY_MAX_LOSS}）\n⛔ 停止推送，明日重置`;
+    client.pushMessage(USER_ID, { type: 'text', text }).catch(() => {});
+    console.warn(`🔴 熔斷觸發：$${dailyStats.dailyLoss.toFixed(2)}`);
   }
 }
  
@@ -198,10 +188,6 @@ function getATRMultiplier(atr, candles) {
 }
  
  
-// ── 監控清單（固定，不打 API）────────────────────
-function updateTopPairs() {
-  console.log(`📊 監控：${WATCH_PAIRS.map(p=>p.replace('-USDT','')).join(' ')}`);
-}
  
 // ══════════════════════════════════════════════
 // 2. 行情抓取
@@ -280,10 +266,6 @@ async function fetchCandles5m(instId) {
   return fetchCandles(instId, '5m', 20);
 }
  
-async function fetchTicker(instId) {
-  const data = await fetchWithRetry('https://www.okx.com/api/v5/market/ticker', { instId });
-  return data?.data?.[0] || null;
-}
  
 // ══════════════════════════════════════════════
 // 3. 技術指標計算
@@ -313,7 +295,7 @@ function calcATR(candles, period = 14) {
     const high = candles[i].high, low = candles[i].low, prevClose = candles[i + 1].close;
     trs.push(Math.max(high - low, Math.abs(high - prevClose), Math.abs(low - prevClose)));
   }
-  return trs.reduce((a, b) => a + b, 0) / trs.length;
+  return trs.length > 0 ? trs.reduce((a, b) => a + b, 0) / trs.length : 0;
 }
  
 function calcBollinger(candles, period = 20) {
@@ -560,14 +542,11 @@ function okxHeaders(method, path, body = '') {
   };
 }
  
-async function okxPost(path, body) {
-  const bodyStr = JSON.stringify(body);
-  const { data } = await axios.post(
-    'https://www.okx.com' + path, bodyStr,
-    { headers: okxHeaders('POST', path, bodyStr), timeout: 10000 }
-  );
+const okxPost = async (path, body) => {
+  const s = JSON.stringify(body);
+  const { data } = await axios.post('https://www.okx.com' + path, s, { headers: okxHeaders('POST', path, s), timeout: 10000 });
   return data;
-}
+};
  
 async function setLeverage(instId, lever) {
   try {
@@ -661,127 +640,6 @@ function buildTextSignal(pair, a, badge) {
   }
 }
  
-function buildSignalCard(pair, a, signalLevel = 'strong') {
-  const isLong  = a.dir === 'long';
-  const isStrong = signalLevel === 'strong';
-  // 強度標示
-  const levelBadge = isStrong ? '🔴 強訊號' : '🟡 觀察訊號';
-  const levelColor = isStrong ? '#ff4466' : '#FFD600';
-  const headerBg  = isStrong ? '#0a0e1a' : '#1a1400';
-  const emoji     = isStrong ? '🔴' : '🟡';
-  const now       = new Date().toLocaleTimeString('zh-TW', { hour: '2-digit', minute: '2-digit', timeZone: 'Asia/Taipei' });
-  const displayPair = pair.replace(/-SWAP$/, '').replace(/-/g, '/');
- 
-  // 當下即時價格（分析時抓到的 entry 就是最新成交價）
-  const currentPrice = (a.currentPrice && a.currentPrice > 0) ? a.currentPrice : a.entry;
-  const priceDiff    = currentPrice - a.entry;
-  const priceDiffStr = fmtDiff(priceDiff, currentPrice);
-  const priceColor   = priceDiff >= 0 ? '#4ade80' : '#f87171';
- 
-  return {
-    type: 'flex',
-    altText: `${emoji} ${displayPair} ${isLong?'做多📈':'做空📉'} 評分${a.score} ${a.isTrend?'趨勢行情':'震盪行情'}`,
-    contents: {
-      type: 'bubble', size: 'kilo',
-      header: {
-        type: 'box', layout: 'horizontal', backgroundColor: headerBg, paddingAll: '12px',
-        contents: [
-          {
-            type: 'box', layout: 'vertical', flex: 1,
-            contents: [
-              { type: 'text', text: '📊 Alice 訊號', color: '#7eb3f7', size: 'sm', weight: 'bold' },
-              { type: 'text', text: now, color: '#6b7a99', size: 'xs' },
-            ]
-          },
-          {
-            type: 'box', layout: 'vertical', alignItems: 'flex-end',
-            contents: [
-              { type: 'text', text: levelBadge, color: levelColor, size: 'xs', weight: 'bold' },
-              { type: 'text', text: `評分 ${a.score}/100`, color: '#6b7a99', size: 'xxs' },
-            ]
-          },
-        ],
-      },
-      body: {
-        type: 'box', layout: 'vertical', backgroundColor: '#141824', spacing: 'sm',
-        contents: [
-          { type: 'box', layout: 'horizontal', contents: [
-            { type: 'text', text: displayPair, color: '#e8eaf0', size: 'xl', weight: 'bold', flex: 1 },
-            { type: 'text', text: isLong ? '做多 📈' : '做空 📉', color: isLong ? '#4ade80' : '#f87171', size: 'sm', align: 'end', gravity: 'center' },
-          ]},
- 
-          // ── 當下即時價格區塊（新增）──────────────────
-          { type: 'box', layout: 'horizontal', backgroundColor: '#0d1520', cornerRadius: '6px', paddingAll: '8px', margin: 'sm', contents: [
-            { type: 'box', layout: 'vertical', flex: 1, contents: [
-              { type: 'text', text: '💹 即時價格', color: '#6b7a99', size: 'xxs' },
-              { type: 'text', text: fmt(currentPrice), color: '#00cfff', size: 'lg', weight: 'bold' },
-            ]},
-            { type: 'box', layout: 'vertical', alignItems: 'flex-end', contents: [
-              { type: 'text', text: priceDiffStr, color: priceColor, size: 'sm', weight: 'bold' },
-              { type: 'text', text: `RSI ${a.rsi?.toFixed(0)} | ADX ${a.adx?.toFixed(0)||'—'} ${a.isTrend?'📊趨勢':'〰️震盪'} | ${a.dir==='long'?'多頭↑':'空頭↓'} ${a.doubleCapital?'⚡':''}`, color: '#6b7a99', size: 'xxs' },
-            ]},
-          ]},
- 
-          { type: 'separator', color: '#ffffff12' },
- 
-          { type: 'box', layout: 'baseline', spacing: 'sm', contents: [
-            { type: 'text', text: '訊號價', color: '#6b7a99', size: 'xs', flex: 1 },
-            { type: 'text', text: fmt(a.entry), color: '#e8eaf0', size: 'sm', weight: 'bold', flex: 2 },
-            { type: 'text', text: '槓桿', color: '#6b7a99', size: 'xs', flex: 1 },
-            { type: 'text', text: `${a.leverage}x`, color: '#fbbf24', size: 'sm', weight: 'bold', flex: 2 },
-          ]},
-          { type: 'box', layout: 'baseline', spacing: 'sm', contents: [
-            { type: 'text', text: isLong ? '止損 ▼' : '止損 ▲', color: '#6b7a99', size: 'xs', flex: 1 },
-            { type: 'text', text: fmt(a.sl), color: '#f87171', size: 'sm', weight: 'bold', flex: 2 },
-            { type: 'text', text: '最虧', color: '#6b7a99', size: 'xs', flex: 1 },
-            { type: 'text', text: `-$${a.slAmount}`, color: '#f87171', size: 'sm', weight: 'bold', flex: 2 },
-          ]},
-          { type: 'separator', color: '#ffffff12' },
- 
-          // 止盈三等分
-          { type: 'text', text: '🎯 止盈三等分', color: '#4ade80', size: 'xs', weight: 'bold' },
-          { type: 'box', layout: 'baseline', spacing: 'sm', contents: [
-            { type: 'text', text: '第1', color: '#6b7a99', size: 'xs', flex: 1 },
-            { type: 'text', text: fmt(a.tp1), color: '#4ade80', size: 'xs', flex: 2 },
-            { type: 'text', text: `+$${a.tp1Amount}`, color: '#4ade80', size: 'xs', flex: 2 },
-          ]},
-          { type: 'box', layout: 'baseline', spacing: 'sm', contents: [
-            { type: 'text', text: '第2', color: '#6b7a99', size: 'xs', flex: 1 },
-            { type: 'text', text: fmt(a.tp2), color: '#4ade80', size: 'xs', flex: 2 },
-            { type: 'text', text: `+$${a.tp2Amount}`, color: '#4ade80', size: 'xs', flex: 2 },
-          ]},
-          { type: 'box', layout: 'baseline', spacing: 'sm', contents: [
-            { type: 'text', text: '第3', color: '#6b7a99', size: 'xs', flex: 1 },
-            { type: 'text', text: fmt(a.tp3), color: '#4ade80', size: 'xs', flex: 2 },
-            { type: 'text', text: `+$${a.tp3Amount}`, color: '#4ade80', size: 'xs', flex: 2 },
-          ]},
-          { type: 'separator', color: '#ffffff12' },
- 
-          { type: 'text', text: a.reasons.filter(r => r.ok).map(r => `✅ ${r.t}`).join('  '), color: '#4ade80', size: 'xxs', wrap: true },
-          { type: 'text', text: a.reasons.filter(r => !r.ok).map(r => `❌ ${r.t}`).join('  '), color: '#f87171', size: 'xxs', wrap: true },
-          { type: 'text', text: [
-            a.mtfDir !== 'neutral' ? `📡 MTF${a.mtfDir==='long'?'多':'空'}` : '',
-            a.obvTrend === 'up' ? 'OBV↑' : a.obvTrend === 'down' ? 'OBV↓' : '',
-            a.rsiDiv !== 'none' ? (a.rsiDiv==='bullish'?'🔔底背離':'🔔頂背離') : '',
-          ].filter(Boolean).join('  ') || '—', color: '#00cfff', size: 'xxs', wrap: true },
-          { type: 'separator', color: '#ffffff12' },
- 
-          // 費用
-          { type: 'text', text: `💰 本金$${a.capital}  📊 倉位$${a.positionSize}  💸 費$${a.fee}`, color: '#6b7a99', size: 'xxs', wrap: true },
-        ],
-      },
-      footer: {
-        type: 'box', layout: 'horizontal', backgroundColor: '#0a0e1a', spacing: 'sm',
-        contents: [
-          { type: 'button', style: 'primary', color: isStrong ? '#16a34a' : '#856a00', height: 'sm',
-            action: { type: 'message', label: '✅ 一鍵下單', text: `一鍵下單 ${pair}` } },
-          { type: 'button', style: 'secondary', height: 'sm',
-            action: { type: 'message', label: '❌ 跳過', text: `跳過 ${pair}` } },
-        ],
-      },
-    },
-  };
-}
  
 // ── 掃描推送 ────────────────────────────────────
 let _scanning = false; // 互斥鎖，防止並行掃描
@@ -791,6 +649,7 @@ async function scanAndPush() {
   try { await _doScan(); } finally { _scanning = false; }
 }
 async function _doScan() {
+  lastCronAt = Date.now(); // Watchdog reset
   // ── 每日熔斷檢查 ─────────────────────────────────
   if (dailyStats.isFused) { return; }
  
@@ -1107,10 +966,9 @@ app.listen(PORT, async () => {
     try { await updateBtcTrend(); } catch(e) {}
   }, 2000);
  
-  setTimeout(() => { updateTopPairs(); }, 8000);
+  setTimeout(() => console.log(`📊 監控：${WATCH_PAIRS.map(p=>p.replace('-USDT','')).join(' ')}`), 8000);
  
   setTimeout(async () => {
     try { await scanAndPush(); } catch(e) {}
   }, 20000); // 啟動 20 秒後才開始第一次掃描
 });
- 
