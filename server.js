@@ -16,6 +16,37 @@ const lineConfig = {
   channelSecret:      process.env.LINE_CHANNEL_SECRET,
 };
 const client = new Client(lineConfig);
+ 
+// ── 直接用 axios 推送（繞過 SDK 連線池，更穩定）────────
+async function linePush(text) {
+  for (let i = 1; i <= 3; i++) {
+    try {
+      await axios.post(
+        'https://api.line.me/v2/bot/message/push',
+        { to: USER_ID, messages: [{ type: 'text', text }] },
+        {
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${process.env.LINE_CHANNEL_ACCESS_TOKEN}`,
+          },
+          timeout: 15000,
+          httpAgent:  new (require('http').Agent)({ keepAlive: false }),
+          httpsAgent: new (require('https').Agent)({ keepAlive: false }),
+        }
+      );
+      return true; // 成功
+    } catch (e) {
+      const status = e.response?.status;
+      if (i < 3) {
+        console.warn(`⚠️ LINE 推送失敗 [${status || e.code}]，${i*3}秒後重試 (${i}/3)...`);
+        await new Promise(r => setTimeout(r, i * 3000));
+      } else {
+        console.error(`❌ LINE 推送放棄 [${status || e.code}]: ${e.message}`);
+        return false;
+      }
+    }
+  }
+}
 const USER_ID       = process.env.LINE_USER_ID;
 const MIN_SCORE       = parseInt(process.env.MIN_SCORE     || '65');
 const MAX_LOSS_USDT   = parseFloat(process.env.MAX_LOSS_USDT  || '20');
@@ -95,7 +126,7 @@ function addDailyLoss(amount) {
   if (!dailyStats.isFused && dailyStats.dailyLoss >= DAILY_MAX_LOSS) {
     dailyStats.isFused = true;
     const text = `🚨 熔斷\n今日虧損 $${dailyStats.dailyLoss.toFixed(2)}（上限 $${DAILY_MAX_LOSS}）\n⛔ 停止推送，明日重置`;
-    client.pushMessage(USER_ID, { type: 'text', text }).catch(() => {});
+    linePush(text).catch(() => {});
     console.warn(`🔴 熔斷觸發：$${dailyStats.dailyLoss.toFixed(2)}`);
   }
 }
@@ -708,28 +739,13 @@ async function _doScan() {
   const msg = buildTextSignal(pair, a, badge);
   console.log(`📤 推送 ${pair} ${badge} 評分${a.score}（${msg.length}字）`);
  
-  // 推送加入重試（最多 3 次，每次間隔 3 秒）
-  let pushed = false;
-  for (let attempt = 1; attempt <= 3; attempt++) {
-    try {
-      await client.pushMessage(USER_ID, { type: 'text', text: msg });
-      markPushed(pair, a);
-      pendingOrders[pair] = { pair, analysis: a, createdAt: Date.now() };
-      setCooldown(pair);
-      recordSignal(pair, a.score, a.dir);
-      console.log(`✅ 推送完成：${pair}（第 ${attempt} 次）`);
-      pushed = true;
-      break;
-    } catch (e) {
-      const status = e.response?.status;
-      const code = e.code || '?';
-      if (attempt < 3) {
-        console.warn(`⚠️ 推送失敗 [${status||code}]，${attempt * 3}秒後重試 (${attempt}/3)...`);
-        await new Promise(r => setTimeout(r, attempt * 3000));
-      } else {
-        console.error(`❌ 推送失敗 3 次放棄 ${pair} [${status||code}]: ${e.message}`);
-      }
-    }
+  const ok = await linePush(msg);
+  if (ok) {
+    markPushed(pair, a);
+    pendingOrders[pair] = { pair, analysis: a, createdAt: Date.now() };
+    setCooldown(pair);
+    recordSignal(pair, a.score, a.dir);
+    console.log(`✅ 推送完成：${pair}`);
   }
 }
  
@@ -762,9 +778,8 @@ app.post('/webhook', middleware(lineConfig), async (req, res) => {
       const orderResult = await placeSwapOrder(instId, a);
  
       // 推送結果
-      await client.pushMessage(USER_ID, {
-        type: 'text',
-        text: orderResult + `\n\n` +
+      await linePush(
+        orderResult + `\n\n` +
           `${displayPair} ${isLong ? '做多 📈' : '做空 📉'}\n` +
           `━━━━━━━━━━━━\n` +
           `💰 本金：$${a.capital}${a.doubleCapital ? ' ⚡' : ''}  ⚡ ${a.leverage}x\n` +
@@ -774,8 +789,8 @@ app.post('/webhook', middleware(lineConfig), async (req, res) => {
           `🎯 TP1：${fmt(a.tp1)}（+$${a.tp1Amount}）\n` +
           `🎯 TP2：${fmt(a.tp2)}（+$${a.tp2Amount}）\n` +
           `🎯 TP3：${fmt(a.tp3)}（+$${a.tp3Amount}）\n` +
-          `💸 手續費：$${a.fee}`,
-      });
+          `💸 手續費：$${a.fee}`
+      );
       delete pendingOrders[pair];
     } else if (text.startsWith('跳過')) {
       const pair = text.replace('跳過','').trim();
@@ -972,3 +987,4 @@ app.listen(PORT, async () => {
     try { await scanAndPush(); } catch(e) {}
   }, 20000); // 啟動 20 秒後才開始第一次掃描
 });
+ 
