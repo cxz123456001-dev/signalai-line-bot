@@ -612,6 +612,31 @@ async function placeSwapOrder(instId, a) {
  
  
 // ── 訊號卡 ─────────────────────────────────────
+// ── 純文字訊號（輕量版，避免 LINE Flex 限速）─────────
+function buildTextSignal(pair, a, badge) {
+  const isLong = a.dir === 'long';
+  const sym = pair.replace(/-USDT-SWAP$/, '').replace(/-USDT$/, '');
+  const dir = isLong ? '做多 📈' : '做空 📉';
+  const good = a.reasons.filter(r => r.ok).map(r => r.t).join(' · ');
+  const bad  = a.reasons.filter(r => !r.ok).map(r => r.t).join(' · ');
+  return (
+    `${badge} ${sym}/${dir}  評分${a.score}\n` +
+    `━━━━━━━━━━━━\n` +
+    `💹 現價：${fmt(a.currentPrice || a.entry)}\n` +
+    `🟢 進場：${fmt(a.entry)}  ⚡${a.leverage}x\n` +
+    `🛑 止損：${fmt(a.sl)}（-$${a.slAmount}）\n` +
+    `━━━━━━━━━━━━\n` +
+    `🎯 TP1：${fmt(a.tp1)}（+$${a.tp1Amount}）\n` +
+    `🎯 TP2：${fmt(a.tp2)}（+$${a.tp2Amount}）\n` +
+    `🎯 TP3：${fmt(a.tp3)}（+$${a.tp3Amount}）\n` +
+    `━━━━━━━━━━━━\n` +
+    `✅ ${good}\n` +
+    (bad ? `❌ ${bad}\n` : '') +
+    `💰 本金$${a.capital}  倉位$${a.positionSize}\n` +
+    `\n輸入「一鍵下單 ${pair}」下單`
+  );
+}
+ 
 function buildSignalCard(pair, a, signalLevel = 'strong') {
   const isLong  = a.dir === 'long';
   const isStrong = signalLevel === 'strong';
@@ -792,19 +817,21 @@ async function _doScan() {
  
       // ── 方案C：訊號強度分級推送 ───────────────────
       if (a.score >= 80) {
-        await client.pushMessage(USER_ID, buildSignalCard(pair, a, 'strong'));
+        const msg = buildTextSignal(pair, a, '🔴 強訊號');
+        await client.pushMessage(USER_ID, { type: 'text', text: msg });
         pendingOrders[pair] = { pair, analysis: a, createdAt: Date.now() };
         setCooldown(pair);
         recordSignal(pair, a.score, a.dir);
-        console.log(`🔴 強訊號推送：${pair} 評分${a.score} ADX${a.adx?.toFixed(0)} MTF:${a.mtfDir}`);
-        await new Promise(r => setTimeout(r, 1000)); // LINE 推送間隔
+        console.log(`🔴 強訊號推送：${pair} 評分${a.score}`);
+        await new Promise(r => setTimeout(r, 500));
       } else if (a.score >= MIN_SCORE) {
-        await client.pushMessage(USER_ID, buildSignalCard(pair, a, 'watch'));
+        const msg = buildTextSignal(pair, a, '🟡 中訊號');
+        await client.pushMessage(USER_ID, { type: 'text', text: msg });
         pendingOrders[pair] = { pair, analysis: a, createdAt: Date.now() };
         setCooldown(pair);
         recordSignal(pair, a.score, a.dir);
         console.log(`🟡 中訊號推送：${pair} 評分${a.score}`);
-        await new Promise(r => setTimeout(r, 1000)); // LINE 推送間隔
+        await new Promise(r => setTimeout(r, 500));
       } else if (a.score >= 50) {
         recordSignal(pair, a.score, a.dir);
       }
