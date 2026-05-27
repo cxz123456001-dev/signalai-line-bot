@@ -17,37 +17,38 @@ const lineConfig = {
 };
 const client = new Client(lineConfig);
  
-// ── 直接用 axios 推送（繞過 SDK 連線池，更穩定）────────
-async function linePush(text) {
+// ── Discord Webhook 推送（完全免費、無月限）────────────
+async function discordPush(text, isSignal = false) {
+  if (!DISCORD_WEBHOOK) {
+    console.warn('⚠️ DISCORD_WEBHOOK_URL 未設定，跳過推送');
+    return false;
+  }
+  // 訊號用 Embed 卡片（有顏色框），一般通知用純文字
+  const body = isSignal
+    ? { embeds: [{ description: text, color: 0x00cfff }] }
+    : { content: text };
+ 
   for (let i = 1; i <= 3; i++) {
     try {
-      await axios.post(
-        'https://api.line.me/v2/bot/message/push',
-        { to: USER_ID, messages: [{ type: 'text', text }] },
-        {
-          headers: {
-            'Content-Type': 'application/json',
-            Authorization: `Bearer ${process.env.LINE_CHANNEL_ACCESS_TOKEN}`,
-          },
-          timeout: 15000,
-          httpAgent:  new (require('http').Agent)({ keepAlive: false }),
-          httpsAgent: new (require('https').Agent)({ keepAlive: false }),
-        }
-      );
-      return true; // 成功
+      await axios.post(DISCORD_WEBHOOK, body, { timeout: 15000 });
+      return true;
     } catch (e) {
       const status = e.response?.status;
       if (i < 3) {
-        console.warn(`⚠️ LINE 推送失敗 [${status || e.code}]，${i*3}秒後重試 (${i}/3)...`);
+        console.warn(`⚠️ Discord 推送失敗 [${status||e.code}]，${i*3}秒後重試 (${i}/3)...`);
         await new Promise(r => setTimeout(r, i * 3000));
       } else {
-        console.error(`❌ LINE 推送放棄 [${status || e.code}]: ${e.message}`);
+        console.error(`❌ Discord 推送放棄 [${status||e.code}]: ${e.message}`);
         return false;
       }
     }
   }
 }
-const USER_ID       = process.env.LINE_USER_ID;
+ 
+// linePush 別名（相容現有呼叫點）
+const linePush = (text) => discordPush(text, true);
+const USER_ID         = process.env.LINE_USER_ID;
+const DISCORD_WEBHOOK = process.env.DISCORD_WEBHOOK_URL || '';
 const MIN_SCORE       = parseInt(process.env.MIN_SCORE     || '65');
 const MAX_LOSS_USDT   = parseFloat(process.env.MAX_LOSS_USDT  || '20');
 const BASE_CAPITAL    = parseFloat(process.env.BASE_CAPITAL   || '100');
@@ -650,24 +651,24 @@ function buildTextSignal(pair, a, badge) {
     const bad  = (a.reasons || []).filter(r => !r.ok).map(r => r.t).join(' · ');
     const price = a.currentPrice || a.entry || 0;
     return (
-      `${badge} ${sym} ${dir}  評分${a.score}\n` +
-      `━━━━━━━━━━━━\n` +
-      `💹 現價：${fmt(price)}\n` +
-      `🟢 進場：${fmt(a.entry||0)}  ⚡${a.leverage||1}x\n` +
-      `🛑 止損：${fmt(a.sl||0)}（-$${a.slAmount||0}）\n` +
-      `━━━━━━━━━━━━\n` +
-      `🎯 TP1：${fmt(a.tp1||0)}（+$${a.tp1Amount||0}）\n` +
-      `🎯 TP2：${fmt(a.tp2||0)}（+$${a.tp2Amount||0}）\n` +
-      `🎯 TP3：${fmt(a.tp3||0)}（+$${a.tp3Amount||0}）\n` +
-      `━━━━━━━━━━━━\n` +
+      `${badge} **${sym}** ${dir}  評分 **${a.score}**\n` +
+      `──────────────\n` +
+      `💹 現價：\`${fmt(price)}\`\n` +
+      `🟢 進場：\`${fmt(a.entry||0)}\`  ⚡${a.leverage||1}x\n` +
+      `🛑 止損：\`${fmt(a.sl||0)}\`（-$${a.slAmount||0}）\n` +
+      `──────────────\n` +
+      `🎯 TP1：\`${fmt(a.tp1||0)}\`（+$${a.tp1Amount||0}）\n` +
+      `🎯 TP2：\`${fmt(a.tp2||0)}\`（+$${a.tp2Amount||0}）\n` +
+      `🎯 TP3：\`${fmt(a.tp3||0)}\`（+$${a.tp3Amount||0}）\n` +
+      `──────────────\n` +
       `✅ ${good}\n` +
       (bad ? `❌ ${bad}\n` : '') +
-      `💰 $${a.capital||100}本金  $${a.positionSize||0}倉位\n` +
-      `\n回覆「一鍵下單 ${pair}」執行`
+      `💰 本金 $${a.capital||100} · 倉位 $${a.positionSize||0}\n` +
+      `\n📌 LINE 輸入「一鍵下單 ${pair}」下單`
     );
   } catch (err) {
-    console.error('buildTextSignal 錯誤:', err.message, JSON.stringify(a).slice(0,200));
-    return `${badge} ${pair} 訊號（格式錯誤，請查看 log）`;
+    console.error('buildTextSignal 錯誤:', err.message);
+    return `${badge} ${pair} 訊號（格式錯誤）`;
   }
 }
  
@@ -807,6 +808,7 @@ app.post('/webhook', middleware(lineConfig), async (req, res) => {
           `🔍 監控：${WATCH_PAIRS.length} 個幣對\n` +
           `⚡ 門檻：${MIN_SCORE}分 | 止損上限 $${MAX_LOSS_USDT}\n` +
           `💰 本金：$${BASE_CAPITAL}\n\n` +
+          `Discord: ${DISCORD_WEBHOOK ? '✅ 已設定' : '❌ 未設定'}\n` +
           `指令：掃描 / 幣對 / 報告 / 清除冷卻 / 重置熔斷`
       });
     } else if (text === '幣對') {
