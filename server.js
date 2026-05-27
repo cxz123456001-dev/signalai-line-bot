@@ -1052,4 +1052,3 @@ app.listen(PORT, async () => {
     try { await scanAndPush(); } catch(e) {}
   }, 20000); // 啟動 20 秒後才開始第一次掃描
 });
- 
