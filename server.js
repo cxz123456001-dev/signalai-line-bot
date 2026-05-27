@@ -810,76 +810,60 @@ async function _doScan() {
     }
   }
  
+  // ── 收集所有有效訊號，每輪只推送最高分一個 ────────
+  const validSignals = [];
+ 
   for (const res of results) {
-    if (res.status === 'rejected') { console.error('❌ 分析失敗:', res.reason?.message); continue; }
+    if (res.status === 'rejected') continue;
     const { pair, a } = res.value;
-    try {
-      if (a.dir === 'neutral') continue;
+    if (!a || a.dir === 'neutral') continue;
+    if (a.score < MIN_SCORE) { if (a.score >= 50) recordSignal(pair, a.score, a.dir); continue; }
+    if (a.dir === 'long'  && btcTrend === 'bear' && a.score < 80) continue;
+    if (a.dir === 'short' && btcTrend === 'bull' && a.score < 80) continue;
+    if (isOnCooldown(pair)) continue;
+    if (isDuplicatePush(pair, a)) { console.log(`⏭ 重複略過 ${pair}`); continue; }
+    validSignals.push({ pair, a });
+  }
  
-      // ── Phase1：BTC 情緒過濾（寬鬆版）──────────────
-      // BTC空頭 → 禁多頭；BTC多頭 → 禁空頭；中性 → 兩邊都允許
-      if (a.dir === 'long'  && btcTrend === 'bear' && a.score < 80) {
-        continue;
-      }
-      if (a.dir === 'short' && btcTrend === 'bull' && a.score < 80) {
-        continue;
-      }
+  // 按需查資金費率（只查有訊號的幣）
+  for (const s of validSignals) {
+    const fr = await getFundRate(toSwap(s.pair)).catch(() => 0);
+    if (s.a.dir === 'long'  && fr >  FUND_RATE_LIMIT) { s.skip = true; continue; }
+    if (s.a.dir === 'short' && fr < -FUND_RATE_LIMIT) { s.skip = true; continue; }
+  }
+  const pushable = validSignals.filter(s => !s.skip);
  
-      // ── Phase2：資金費率（有訊號才查，按需呼叫）──
-      const fundRateNow = await getFundRate(toSwap(pair)).catch(() => 0);
-      if (a.dir === 'long'  && fundRateNow >  FUND_RATE_LIMIT) {
-        continue;
-      }
-      if (a.dir === 'short' && fundRateNow < -FUND_RATE_LIMIT) {
-        continue;
-      }
+  if (pushable.length === 0) { console.log('⚪ 本輪無有效訊號'); return; }
  
-      // ── 方案B：冷卻機制 ───────────────────────────
-      if (isOnCooldown(pair)) {
-        continue;
-      }
+  // 只推送評分最高的一個
+  pushable.sort((x, y) => y.a.score - x.a.score);
+  const best = pushable[0];
+  if (pushable.length > 1) {
+    const others = pushable.slice(1).map(s => `${s.pair.replace('-USDT','')}(${s.a.score})`).join(' ');
+    console.log(`  其他訊號略過：${others}`);
+    pushable.slice(1).forEach(s => recordSignal(s.pair, s.a.score, s.a.dir));
+  }
  
-      // ── 方案C：訊號強度分級推送 ───────────────────
-      if (a.score >= 80) {
-        if (isDuplicatePush(pair, a)) { console.log(`⏭ 重複訊號略過 ${pair}`); continue; }
-        const msg = buildTextSignal(pair, a, '🔴 強訊號');
-        if (!msg || msg.length < 10) { console.error(`❌ 訊息為空 ${pair}`); continue; }
-        console.log(`📤 推送中 ${pair}（${msg.length}字）`);
-        await client.pushMessage(USER_ID, { type: 'text', text: msg });
-        markPushed(pair, a);
-        pendingOrders[pair] = { pair, analysis: a, createdAt: Date.now() };
-        setCooldown(pair);
-        recordSignal(pair, a.score, a.dir);
-        console.log(`🔴 強訊號推送：${pair} 評分${a.score}`);
-        await new Promise(r => setTimeout(r, 500));
-      } else if (a.score >= MIN_SCORE) {
-        if (isDuplicatePush(pair, a)) { console.log(`⏭ 重複訊號略過 ${pair}`); continue; }
-        const msg = buildTextSignal(pair, a, '🟡 中訊號');
-        if (!msg || msg.length < 10) { console.error(`❌ 訊息為空 ${pair}`); continue; }
-        console.log(`📤 推送中 ${pair}（${msg.length}字）`);
-        await client.pushMessage(USER_ID, { type: 'text', text: msg });
-        markPushed(pair, a);
-        pendingOrders[pair] = { pair, analysis: a, createdAt: Date.now() };
-        setCooldown(pair);
-        recordSignal(pair, a.score, a.dir);
-        console.log(`🟡 中訊號推送：${pair} 評分${a.score}`);
-        await new Promise(r => setTimeout(r, 500));
-      } else if (a.score >= 50) {
-        recordSignal(pair, a.score, a.dir);
-      }
-    } catch (e) {
-      const status = e.response?.status;
-      const errBody = JSON.stringify(e.response?.data || {}).slice(0, 100);
-      if (status === 429) {
-        console.warn(`⚠️ LINE 429 ${pair}，等 5 秒`);
-        await new Promise(r => setTimeout(r, 5000));
-      } else if (status === 400) {
-        console.error(`❌ LINE 400 格式錯誤 ${pair}: ${errBody}`);
-      } else if (!status) {
-        console.error(`❌ LINE 網路錯誤 ${pair}: ${e.message} (code:${e.code||'?'})`);
-      } else {
-        console.error(`❌ LINE [${status}] ${pair}: ${errBody || e.message}`);
-      }
+  const { pair, a } = best;
+  const badge = a.score >= 80 ? '🔴 強訊號' : '🟡 中訊號';
+  const msg = buildTextSignal(pair, a, badge);
+  console.log(`📤 推送 ${pair} ${badge} 評分${a.score}（${msg.length}字）`);
+  try {
+    await client.pushMessage(USER_ID, { type: 'text', text: msg });
+    markPushed(pair, a);
+    pendingOrders[pair] = { pair, analysis: a, createdAt: Date.now() };
+    setCooldown(pair);
+    recordSignal(pair, a.score, a.dir);
+    console.log(`✅ 推送完成：${pair}`);
+  } catch (e) {
+    const status = e.response?.status;
+    if (status === 429) {
+      console.warn(`⚠️ LINE 429，等 5 秒`);
+      await new Promise(r => setTimeout(r, 5000));
+    } else if (!status) {
+      console.error(`❌ LINE 網路錯誤: ${e.message} (${e.code||'?'})`);
+    } else {
+      console.error(`❌ LINE [${status}]: ${JSON.stringify(e.response?.data||{}).slice(0,100)}`);
     }
   }
 }
