@@ -848,22 +848,28 @@ async function _doScan() {
   const badge = a.score >= 80 ? '🔴 強訊號' : '🟡 中訊號';
   const msg = buildTextSignal(pair, a, badge);
   console.log(`📤 推送 ${pair} ${badge} 評分${a.score}（${msg.length}字）`);
-  try {
-    await client.pushMessage(USER_ID, { type: 'text', text: msg });
-    markPushed(pair, a);
-    pendingOrders[pair] = { pair, analysis: a, createdAt: Date.now() };
-    setCooldown(pair);
-    recordSignal(pair, a.score, a.dir);
-    console.log(`✅ 推送完成：${pair}`);
-  } catch (e) {
-    const status = e.response?.status;
-    if (status === 429) {
-      console.warn(`⚠️ LINE 429，等 5 秒`);
-      await new Promise(r => setTimeout(r, 5000));
-    } else if (!status) {
-      console.error(`❌ LINE 網路錯誤: ${e.message} (${e.code||'?'})`);
-    } else {
-      console.error(`❌ LINE [${status}]: ${JSON.stringify(e.response?.data||{}).slice(0,100)}`);
+ 
+  // 推送加入重試（最多 3 次，每次間隔 3 秒）
+  let pushed = false;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      await client.pushMessage(USER_ID, { type: 'text', text: msg });
+      markPushed(pair, a);
+      pendingOrders[pair] = { pair, analysis: a, createdAt: Date.now() };
+      setCooldown(pair);
+      recordSignal(pair, a.score, a.dir);
+      console.log(`✅ 推送完成：${pair}（第 ${attempt} 次）`);
+      pushed = true;
+      break;
+    } catch (e) {
+      const status = e.response?.status;
+      const code = e.code || '?';
+      if (attempt < 3) {
+        console.warn(`⚠️ 推送失敗 [${status||code}]，${attempt * 3}秒後重試 (${attempt}/3)...`);
+        await new Promise(r => setTimeout(r, attempt * 3000));
+      } else {
+        console.error(`❌ 推送失敗 3 次放棄 ${pair} [${status||code}]: ${e.message}`);
+      }
     }
   }
 }
