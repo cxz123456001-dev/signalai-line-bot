@@ -57,7 +57,7 @@ function fmtDiff(diff, price) {
 // ── 核心必選幣對（流動性佳、技術指標可靠）──────────
 const FIXED_PAIRS = [
   'BTC-USDT','ETH-USDT','SOL-USDT',
-  'XRP-USDT','DOGE-USDT','ADA-USDT',
+  'XRP-USDT','BNB-USDT','LINK-USDT',
 ];
  
  
@@ -193,7 +193,7 @@ const rateLimiter = {
   queue: [],
   running: 0,
   maxConcurrent: 1,        // 單一並行
-  minInterval: 800,        // 每個請求間隔 800ms = 最多 1.25次/秒
+  minInterval: 600,        // 每個請求間隔 600ms
   lastCallTime: 0,
  
   async acquire() {
@@ -985,7 +985,7 @@ app.get('/health', (req, res) => res.json({
 // 定時任務
 // ══════════════════════════════════════════════
 cron.schedule('*/3 * * * *', scanAndPush);
-cron.schedule('*/10 * * * *', () => updateBtcTrend().catch(()=>{})); // BTC趨勢獨立排程
+cron.schedule('*/15 * * * *', () => updateBtcTrend().catch(()=>{}));
 cron.schedule('*/15 * * * *', updateBtcTrend);
  
 // 每 30 分鐘清除超過 2 小時的過期待確認訂單
@@ -1033,7 +1033,7 @@ app.listen(PORT, async () => {
   let lastCronAt = Date.now();
   setInterval(() => {
     const elapsed = (Date.now() - lastCronAt) / 1000;
-    if (elapsed > 14 * 60) {
+    if (elapsed > 5 * 60) {
       console.warn(`⚠️ Watchdog：${Math.floor(elapsed)}s 未掃描，強制觸發`);
       lastCronAt = Date.now();
       scanAndPush().catch(e => console.error('Watchdog 觸發失敗:', e.message));
@@ -1052,3 +1052,4 @@ app.listen(PORT, async () => {
     try { await scanAndPush(); } catch(e) {}
   }, 20000); // 啟動 20 秒後才開始第一次掃描
 });
+ 
