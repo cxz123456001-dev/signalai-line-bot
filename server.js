@@ -95,7 +95,14 @@ let btcTrend = 'neutral'; // 'bull' | 'bear' | 'neutral'
 let btcTrendUpdatedAt = 0;
 async function updateBtcTrend() {
   try {
-    const candles = await fetchCandles('BTC-USDT-SWAP', '1H', 25).catch(() => []);
+    // 直接呼叫 axios，不走 rateLimiter，避免佔用掃描配額
+    let candles = [];
+    try {
+      const { data } = await axios.get('https://www.okx.com/api/v5/market/candles', {
+        params: { instId: 'BTC-USDT-SWAP', bar: '1H', limit: 25 }, timeout: 10000
+      });
+      candles = data?.data?.map(c => ({ close: +c[4], high: +c[2], low: +c[3], vol: +c[5] })) || [];
+    } catch (_) {}
     if (!candles.length) return;
     const ma20 = candles.slice(0, 20).reduce((s, c) => s + c.close, 0) / Math.min(20, candles.length);
     const price = candles[0].close;
@@ -114,8 +121,9 @@ async function getFundRate(instId) {
   const cached = fundRateCache.get(instId);
   if (cached && Date.now() - cached.ts < 15 * 60 * 1000) return cached.rate;
   try {
+    // 直接 axios，不走 rateLimiter，費率不需要即時
     const { data } = await axios.get('https://www.okx.com/api/v5/public/funding-rate', {
-      params: { instId }
+      params: { instId }, timeout: 8000
     });
     const rate = parseFloat(data.data[0]?.fundingRate || 0);
     fundRateCache.set(instId, { rate, ts: Date.now() });
@@ -377,11 +385,12 @@ function scoreShort(reasons, score, p) {
 async function analyze(instId) {
   const mtf = { mtfDir: 'neutral', mtfBonus: 0 }; // MTF 已移除
  
-  const [candles, candles5m, ticker] = await Promise.all([
+  const [candles, candles5m] = await Promise.all([
     fetchCandles(instId, '1H', 50).catch(() => []),
     fetchCandles5m(instId).catch(() => []),
-    fetchTicker(instId).catch(() => null),
   ]);
+  // 現價直接從最新 K 線取，省去一次 Ticker API
+  const ticker = candles.length ? { last: String(candles[0].close) } : null;
  
   // ── 資料完整性檢查 ─────────────────────────────────
   if (!candles.length || candles.length < 25) {
@@ -748,9 +757,9 @@ async function _doScan() {
     const pair = WATCH_PAIRS[i];
     const r = await analyze(pair).then(a => ({ pair, a })).catch(e => ({ status:'rejected', reason:e }));
     results.push({ status: 'fulfilled', value: r });
-    // 每幣掃完後休息 2 秒（3次API × 800ms + 緩衝）
+    // 每幣掃完後休息 1 秒（2次API × 800ms + 緩衝）
     if (i < WATCH_PAIRS.length - 1) {
-      await new Promise(r => setTimeout(r, 2000));
+      await new Promise(r => setTimeout(r, 1000));
     }
   }
  
