@@ -762,11 +762,27 @@ async function _doScan() {
     const { pair, a } = res.value;
     if (!a || a.dir === 'neutral') continue;
     if (a.score < MIN_SCORE) { if (a.score >= 50) recordSignal(pair, a.score, a.dir); continue; }
-    // 量能太萎縮的訊號可靠性低（volSurge < 0.7 代表成交量剩 70% 以下）
+    // 量能太萎縮的訊號可靠性低
     if (a.flow5m?.volSurge < 0.7) { console.log(`⚡ ${pair} 量能萎縮(${a.flow5m.volSurge.toFixed(2)}x)，跳過`); continue; }
-    // BTC 趨勢過濾（更嚴格，提升勝率）
+    // BTC 趨勢過濾
     if (a.dir === 'long'  && btcTrend === 'bear' && a.score < 85) continue;
     if (a.dir === 'short' && btcTrend === 'bull' && a.score < 85) continue;
+ 
+    // ── 方案 D：否決條件（硬性過濾，不管評分多高）──────
+    const rsi = a.rsi || 50;
+    const atr = a.atr || 0;
+    const slDist = Math.abs(a.entry - a.sl);
+    const candleRange = a.entry * 0.02; // 近似
+    // D1：RSI 極端值（做多時過熱，做空時過賣）
+    if (a.dir === 'long'  && rsi > 75) { console.log(`🚫 ${pair} RSI過熱(${rsi.toFixed(0)})，否決做多`); continue; }
+    if (a.dir === 'short' && rsi < 25) { console.log(`🚫 ${pair} RSI過賣(${rsi.toFixed(0)})，否決做空`); continue; }
+    // D2：成交量極度萎縮（volSurge < 0.5，假突破風險極高）
+    if (a.flow5m?.volSurge < 0.5) { console.log(`🚫 ${pair} 成交量極萎縮(${a.flow5m.volSurge.toFixed(2)}x)，否決`); continue; }
+    // D3：止損距離過大（slDist / entry > 3%，風險過高）
+    if (a.entry > 0 && slDist / a.entry > 0.03) { console.log(`🚫 ${pair} 止損過大(${(slDist/a.entry*100).toFixed(1)}%)，否決`); continue; }
+    // D4：止損距離過小（slDist / entry < 0.2%，容易被掃）
+    if (a.entry > 0 && slDist / a.entry < 0.002) { console.log(`🚫 ${pair} 止損過近(${(slDist/a.entry*100).toFixed(2)}%)，否決`); continue; }
+ 
     if (isOnCooldown(pair)) continue;
     if (isDuplicatePush(pair, a)) { console.log(`⏭ 重複略過 ${pair}`); continue; }
     validSignals.push({ pair, a });
