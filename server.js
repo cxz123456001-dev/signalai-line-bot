@@ -342,6 +342,19 @@ function calcBollinger(candles, period = 20) {
   return { upper: avg + 2 * std, middle: avg, lower: avg - 2 * std };
 }
  
+// ── W2：VWAP 計算（成交量加權平均價）──────────────────
+// 機構最常用的參考線，判斷多空力道
+function calcVWAP(candles, period = 20) {
+  const slice = candles.slice(0, Math.min(period, candles.length));
+  let totalPV = 0, totalVol = 0;
+  for (const c of slice) {
+    const typicalPrice = (c.high + c.low + c.close) / 3;
+    totalPV  += typicalPrice * c.vol;
+    totalVol += c.vol;
+  }
+  return totalVol > 0 ? totalPV / totalVol : slice[0]?.close || 0;
+}
+ 
 function calc5mFlow(candles5m) {
   if (!candles5m || candles5m.length < 5) return { bullRatio: 0.5, bearRatio: 0.5, volSurge: 1, avgVol: 0, rebound: false, breakdown: false };
   const r = candles5m.slice(0, 5);
@@ -381,7 +394,7 @@ function calc5mFlow(candles5m) {
  
 // ── 做多評分 ───────────────────────────────────
 function scoreLong(reasons, score, p) {
-  const { last, resistance, support, rsi, macd, boll, ma10, ma20, ma50, flow5m, volRatio, isCandle_bull, bodyRatio, mtf, obvTrend, rsiDiv, isTrend } = p;
+  const { last, resistance, support, rsi, macd, boll, ma10, ma20, ma50, flow5m, volRatio, isCandle_bull, bodyRatio, mtf, obvTrend, rsiDiv, isTrend, vwap, adx } = p;
   if (last.close > resistance && volRatio > 1.2) {
     reasons.push({ t: `突破${fmt(resistance)}阻力`, ok: true }); score += 18;
   }
@@ -429,12 +442,50 @@ function scoreLong(reasons, score, p) {
   if (bullSignals >= 5) { reasons.push({ t: `強多共振(${bullSignals}/6)`, ok: true }); score += 12; }
   else if (bullSignals >= 4) { reasons.push({ t: `多頭共振(${bullSignals}/6)`, ok: true }); score += 6; }
  
+  // ── W2：VWAP 加分（機構參考線）────────────────────
+  if (vwap && last.close) {
+    const vwapDist = (last.close - vwap) / vwap;
+    if (vwapDist > 0.003) {
+      // 現價在 VWAP 上方 0.3% 以上 → 機構淨買入
+      reasons.push({ t: `高於VWAP ${(vwapDist*100).toFixed(1)}%`, ok: true }); score += 10;
+    } else if (vwapDist < -0.003) {
+      // 現價在 VWAP 下方 → 機構淨賣出，做多不利
+      reasons.push({ t: `低於VWAP ${(Math.abs(vwapDist)*100).toFixed(1)}%`, ok: false }); score -= 8;
+    } else {
+      // 現價在 VWAP ±0.3% 之內 → 方向模糊
+      reasons.push({ t: 'VWAP附近震盪', ok: false }); score -= 3;
+    }
+  }
+ 
+  // ── W3：ADX 分層策略 ──────────────────────────────
+  // 根據趨勢強度選對的策略，不在錯誤環境下單
+  if (adx !== undefined) {
+    if (adx < 20) {
+      // 極弱趨勢（震盪市）→ 趨勢突破策略可靠性低
+      if (last.close > resistance) {
+        reasons.push({ t: `ADX弱(${adx.toFixed(0)})突破不可靠`, ok: false }); score -= 10;
+      }
+      // 但均值回歸（RSI超賣反彈）在震盪市反而更準
+      if (rsi < 35) { score += 5; } // 震盪+超賣，額外加分
+    } else if (adx >= 20 && adx < 40) {
+      // 中等趨勢 → 兩種策略都適合，不加不減
+      reasons.push({ t: `ADX中(${adx.toFixed(0)})趨勢適中`, ok: true }); score += 3;
+    } else if (adx >= 40) {
+      // 強趨勢 → 順勢突破最可靠
+      if (last.close > resistance) {
+        reasons.push({ t: `ADX強(${adx.toFixed(0)})順勢突破`, ok: true }); score += 8;
+      } else {
+        reasons.push({ t: `ADX強趨勢做多`, ok: true }); score += 5;
+      }
+    }
+  }
+ 
   return score;
 }
  
 // ── 做空評分 ───────────────────────────────────
 function scoreShort(reasons, score, p) {
-  const { last, support, rsi, macd, boll, ma10, ma20, ma50, flow5m, volRatio, isCandle_bull, bodyRatio, mtf, obvTrend, rsiDiv, isTrend } = p;
+  const { last, support, rsi, macd, boll, ma10, ma20, ma50, flow5m, volRatio, isCandle_bull, bodyRatio, mtf, obvTrend, rsiDiv, isTrend, vwap, adx } = p;
   if (last.close < support && volRatio > 1.2) {
     reasons.push({ t: `跌破${fmt(support)}支撐`, ok: true }); score += 18;
   }
@@ -478,6 +529,40 @@ function scoreShort(reasons, score, p) {
   ].filter(Boolean).length;
   if (bearSignals >= 5) { reasons.push({ t: `強空共振(${bearSignals}/6)`, ok: true }); score += 12; }
   else if (bearSignals >= 4) { reasons.push({ t: `空頭共振(${bearSignals}/6)`, ok: true }); score += 6; }
+ 
+  // ── W2：VWAP 加分（機構參考線）────────────────────
+  if (vwap && last.close) {
+    const vwapDist = (last.close - vwap) / vwap;
+    if (vwapDist < -0.003) {
+      // 現價在 VWAP 下方 → 機構淨賣出，做空有利
+      reasons.push({ t: `低於VWAP ${(Math.abs(vwapDist)*100).toFixed(1)}%`, ok: true }); score += 10;
+    } else if (vwapDist > 0.003) {
+      // 現價在 VWAP 上方 → 機構淨買入，做空不利
+      reasons.push({ t: `高於VWAP ${(vwapDist*100).toFixed(1)}%`, ok: false }); score -= 8;
+    } else {
+      reasons.push({ t: 'VWAP附近震盪', ok: false }); score -= 3;
+    }
+  }
+ 
+  // ── W3：ADX 分層策略 ──────────────────────────────
+  if (adx !== undefined) {
+    if (adx < 20) {
+      // 震盪市 → 做空突破不可靠
+      if (last.close < support) {
+        reasons.push({ t: `ADX弱(${adx.toFixed(0)})跌破不可靠`, ok: false }); score -= 10;
+      }
+      // RSI 超買反轉在震盪市反而準
+      if (rsi > 65) { score += 5; }
+    } else if (adx >= 20 && adx < 40) {
+      reasons.push({ t: `ADX中(${adx.toFixed(0)})趨勢適中`, ok: true }); score += 3;
+    } else if (adx >= 40) {
+      if (last.close < support) {
+        reasons.push({ t: `ADX強(${adx.toFixed(0)})順勢跌破`, ok: true }); score += 8;
+      } else {
+        reasons.push({ t: `ADX強趨勢做空`, ok: true }); score += 5;
+      }
+    }
+  }
  
   return score;
 }
@@ -528,6 +613,7 @@ async function analyze(instId) {
   const macd   = calcMACD(candles);
   const atr    = calcATR(candles);
   const boll   = calcBollinger(candles);
+  const vwap   = calcVWAP(candles); // W2: VWAP
   const flow5m   = calc5mFlow(candles5m);
   const { adx, isTrend, obvTrend, rsiDiv } = calcTrendSignals(candles);
  
@@ -586,9 +672,9 @@ async function analyze(instId) {
   // 評分計算（呼叫獨立函式）
   // ══════════════════════════════════════════════
   if (dir === 'long') {
-    score = scoreLong(reasons, score, { last, resistance, support, rsi, macd, boll, ma10, ma20, ma50, flow5m, volRatio, isCandle_bull, bodyRatio, mtf, obvTrend, rsiDiv, isTrend });
+    score = scoreLong(reasons, score, { last, resistance, support, rsi, macd, boll, ma10, ma20, ma50, flow5m, volRatio, isCandle_bull, bodyRatio, mtf, obvTrend, rsiDiv, isTrend, vwap, adx });
   } else if (dir === 'short') {
-    score = scoreShort(reasons, score, { last, resistance, support, rsi, macd, boll, ma10, ma20, ma50, flow5m, volRatio, isCandle_bull, bodyRatio, mtf, obvTrend, rsiDiv, isTrend });
+    score = scoreShort(reasons, score, { last, resistance, support, rsi, macd, boll, ma10, ma20, ma50, flow5m, volRatio, isCandle_bull, bodyRatio, mtf, obvTrend, rsiDiv, isTrend, vwap, adx });
   } else {
     reasons.push({ t: `RSI中性(${rsi.toFixed(0)})`, ok: false });
     reasons.push({ t: 'MACD方向不明', ok: false });
@@ -665,7 +751,8 @@ async function analyze(instId) {
     slAmount, tp1Amount, tp2Amount, tp3Amount, fee,
     doubleCapital, flow5m, rsi, macd, swapSz,
     currentPrice: currentPrice || entry,
-    adx, isTrend, mtfDir: mtf.mtfDir, obvTrend, rsiDiv, flow5m, trend4h, atr: atr,
+    adx, isTrend, mtfDir: mtf.mtfDir, obvTrend, rsiDiv, flow5m, trend4h, atr: atr, vwap,
+    vwapPos: vwap > 0 ? (last.close > vwap * 1.003 ? '🔼VWAP上' : last.close < vwap * 0.997 ? '🔽VWAP下' : '↔️VWAP中') : '',
   };
 }
  
@@ -765,7 +852,7 @@ function buildTextSignal(pair, a, badge) {
     const price = a.currentPrice || a.entry || 0;
     return (
       `${badge} **${sym}** ${dir}  評分 **${a.score}**/100\n` +
-      `RSI **${(a.rsi||0).toFixed(0)}** · ADX **${(a.adx||0).toFixed(0)}** · ${a.isTrend?'📊 趨勢行情':'〰️ 震盪行情'} · ${isLong?'多頭 ↑':'空頭 ↓'}\n` +
+      `RSI **${(a.rsi||0).toFixed(0)}** · ADX **${(a.adx||0).toFixed(0)}** · ${a.isTrend?'📊 趨勢':'〰️ 震盪'} · ${a.vwapPos||''}\n` +
       `──────────────\n` +
       `💹 現價：\`${fmt(price)}\`\n` +
       `🟢 進場：\`${fmt(a.entry||0)}\`  ⚡${a.leverage||1}x\n` +
