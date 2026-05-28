@@ -18,14 +18,13 @@ const lineConfig = {
 const client = new Client(lineConfig);
  
 // ── Discord Webhook 推送（完全免費、無月限）────────────
-async function discordPush(text, isSignal = false) {
+async function discordPush(text, isSignal = false, color = 0x00CFFF) {
   if (!DISCORD_WEBHOOK) {
     console.warn('⚠️ DISCORD_WEBHOOK_URL 未設定，跳過推送');
     return false;
   }
-  // 訊號用 Embed 卡片（有顏色框），一般通知用純文字
   const body = isSignal
-    ? { embeds: [{ description: text, color: 0x00cfff }] }
+    ? { embeds: [{ description: text, color }] }
     : { content: text };
  
   for (let i = 1; i <= 3; i++) {
@@ -49,7 +48,7 @@ async function discordPush(text, isSignal = false) {
 const linePush = (text) => discordPush(text, true);
 const USER_ID         = process.env.LINE_USER_ID;
 const DISCORD_WEBHOOK = process.env.DISCORD_WEBHOOK_URL || '';
-const MIN_SCORE       = parseInt(process.env.MIN_SCORE     || '65');
+const MIN_SCORE       = parseInt(process.env.MIN_SCORE     || '70'); // 70分以上才推送，減少雜訊
 const MAX_LOSS_USDT   = parseFloat(process.env.MAX_LOSS_USDT  || '20');
 const BASE_CAPITAL    = parseFloat(process.env.BASE_CAPITAL   || '100');
 const MAX_LOSS_PCT    = parseFloat(process.env.MAX_LOSS_PCT   || '0.05');
@@ -90,8 +89,14 @@ const fmtDiff = (d, p) => (d == null ? '—' : (d >= 0 ? '+' : '') + d.toFixed(g
  
 // ── 核心必選幣對（流動性佳、技術指標可靠）──────────
 const FIXED_PAIRS = [
-  'BTC-USDT','ETH-USDT','SOL-USDT',
-  'XRP-USDT','BNB-USDT','LINK-USDT',
+  // 核心大型幣（流動性最佳）
+  'BTC-USDT','ETH-USDT','SOL-USDT','BNB-USDT',
+  // 主流山寨（成交量大）
+  'XRP-USDT','ADA-USDT','AVAX-USDT','TRX-USDT',
+  // 高波動標的
+  'LINK-USDT','DOT-USDT','SUI-USDT','NEAR-USDT',
+  // 迷因幣（高波動）
+  'DOGE-USDT','PEPE-USDT','WIF-USDT','BONK-USDT',
 ];
  
  
@@ -381,6 +386,19 @@ function scoreLong(reasons, score, p) {
   if (rsiDiv === 'bullish')   { reasons.push({ t: 'RSI底背離',   ok: true }); score += 10; }
   if (isTrend) { if (ma10 > ma20 && macd.histogram > 0) score += 5; }
   else         { if (rsi < 35) score += 6; }
+ 
+  // ── 多指標共振加分（3個以上核心指標同向 +10）──
+  const bullSignals = [
+    macd.histogram > 0,
+    rsi < 50,
+    ma10 > ma20,
+    flow5m.bullRatio > 0.55,
+    obvTrend === 'up',
+    volRatio > 1.2,
+  ].filter(Boolean).length;
+  if (bullSignals >= 5) { reasons.push({ t: `強多共振(${bullSignals}/6)`, ok: true }); score += 12; }
+  else if (bullSignals >= 4) { reasons.push({ t: `多頭共振(${bullSignals}/6)`, ok: true }); score += 6; }
+ 
   return score;
 }
  
@@ -413,6 +431,19 @@ function scoreShort(reasons, score, p) {
   if (rsiDiv === 'bearish')   { reasons.push({ t: 'RSI頂背離',   ok: true }); score += 10; }
   if (isTrend) { if (ma10 < ma20 && macd.histogram < 0) score += 5; }
   else         { if (rsi > 65) score += 6; }
+ 
+  // ── 多指標共振加分（3個以上核心指標同向 +10）──
+  const bearSignals = [
+    macd.histogram < 0,
+    rsi > 50,
+    ma10 < ma20,
+    flow5m.bullRatio < 0.45,
+    obvTrend === 'down',
+    volRatio > 1.2,
+  ].filter(Boolean).length;
+  if (bearSignals >= 5) { reasons.push({ t: `強空共振(${bearSignals}/6)`, ok: true }); score += 12; }
+  else if (bearSignals >= 4) { reasons.push({ t: `空頭共振(${bearSignals}/6)`, ok: true }); score += 6; }
+ 
   return score;
 }
  
@@ -439,11 +470,12 @@ async function analyze(instId) {
   if (!last?.close || !last?.high || !last?.low || !last?.vol) {
     throw new Error(`K線欄位缺失`);
   }
-  const prev5 = candles.slice(1, 6);
- 
-  const resistance = Math.max(...prev5.map(c => c.high));
-  const support    = Math.min(...prev5.map(c => c.low));
-  const avgVol     = prev5.reduce((s, c) => s + c.vol, 0) / prev5.length;
+  const prev5  = candles.slice(1, 6);
+  const prev10 = candles.slice(1, 11);
+  // 10根支撐阻力更可靠
+  const resistance = Math.max(...prev10.map(c => c.high));
+  const support    = Math.min(...prev10.map(c => c.low));
+  const avgVol     = prev10.reduce((s, c) => s + c.vol, 0) / prev10.length;
   const volRatio   = last.vol / avgVol;
   const ma10       = candles.slice(0, 10).reduce((s, c) => s + c.close, 0) / 10;
   const ma20       = candles.slice(0, 20).reduce((s, c) => s + c.close, 0) / 20;
@@ -482,8 +514,8 @@ async function analyze(instId) {
   if (last.close > boll.upper)                             longPts  += 1;
   if (last.close < boll.lower)                             shortPts += 1;
  
-  if      (longPts  >= shortPts + 3) dir = 'long';
-  else if (shortPts >= longPts  + 3) dir = 'short';
+  if      (longPts  >= shortPts + 4) dir = 'long';  // 需要更明確的多頭信號
+  else if (shortPts >= longPts  + 4) dir = 'short'; // 需要更明確的空頭信號
  
   // ══════════════════════════════════════════════
   // 評分計算（呼叫獨立函式）
@@ -552,7 +584,7 @@ async function analyze(instId) {
     slAmount, tp1Amount, tp2Amount, tp3Amount, fee,
     doubleCapital, flow5m, rsi, macd, swapSz,
     currentPrice: currentPrice || entry,
-    adx, isTrend, mtfDir: mtf.mtfDir, obvTrend, rsiDiv,
+    adx, isTrend, mtfDir: mtf.mtfDir, obvTrend, rsiDiv, flow5m,
   };
 }
  
@@ -651,20 +683,25 @@ function buildTextSignal(pair, a, badge) {
     const bad  = (a.reasons || []).filter(r => !r.ok).map(r => r.t).join(' · ');
     const price = a.currentPrice || a.entry || 0;
     return (
-      `${badge} **${sym}** ${dir}  評分 **${a.score}**\n` +
+      `${badge} **${sym}** ${dir}  評分 **${a.score}**/100\n` +
+      `RSI **${(a.rsi||0).toFixed(0)}** · ADX **${(a.adx||0).toFixed(0)}** · ${a.isTrend?'📊 趨勢行情':'〰️ 震盪行情'} · ${isLong?'多頭 ↑':'空頭 ↓'}\n` +
       `──────────────\n` +
       `💹 現價：\`${fmt(price)}\`\n` +
       `🟢 進場：\`${fmt(a.entry||0)}\`  ⚡${a.leverage||1}x\n` +
-      `🛑 止損：\`${fmt(a.sl||0)}\`（-$${a.slAmount||0}）\n` +
+      `🔺 止損：\`${fmt(a.sl||0)}\`（最虧 **-$${a.slAmount||0}**）\n` +
       `──────────────\n` +
-      `🎯 TP1：\`${fmt(a.tp1||0)}\`（+$${a.tp1Amount||0}）\n` +
-      `🎯 TP2：\`${fmt(a.tp2||0)}\`（+$${a.tp2Amount||0}）\n` +
-      `🎯 TP3：\`${fmt(a.tp3||0)}\`（+$${a.tp3Amount||0}）\n` +
+      `🎯 TP1：\`${fmt(a.tp1||0)}\`（**+$${a.tp1Amount||0}**）\n` +
+      `🎯 TP2：\`${fmt(a.tp2||0)}\`（**+$${a.tp2Amount||0}**）\n` +
+      `🎯 TP3：\`${fmt(a.tp3||0)}\`（**+$${a.tp3Amount||0}**）\n` +
       `──────────────\n` +
       `✅ ${good}\n` +
       (bad ? `❌ ${bad}\n` : '') +
-      `💰 本金 $${a.capital||100} · 倉位 $${a.positionSize||0}\n` +
-      `\n📌 LINE 輸入「一鍵下單 ${pair}」下單`
+      (a.rsiDiv && a.rsiDiv !== 'none' ? `🔔 RSI ${a.rsiDiv==='bullish'?'底背離':'頂背離'} · ` : '') +
+      (a.obvTrend === 'up' ? 'OBV↑ ' : a.obvTrend === 'down' ? 'OBV↓ ' : '') +
+      ((a.rsiDiv && a.rsiDiv !== 'none') || a.obvTrend !== 'flat' ? '\n' : '') +
+      `──────────────\n` +
+      `💰 本金 **$${a.capital||100}** · 倉位 **$${a.positionSize||0}** · 手續費 $${a.fee||0}\n` +
+      `📌 LINE 傳「一鍵下單 ${pair}」下單`
     );
   } catch (err) {
     console.error('buildTextSignal 錯誤:', err.message);
@@ -709,8 +746,11 @@ async function _doScan() {
     const { pair, a } = res.value;
     if (!a || a.dir === 'neutral') continue;
     if (a.score < MIN_SCORE) { if (a.score >= 50) recordSignal(pair, a.score, a.dir); continue; }
-    if (a.dir === 'long'  && btcTrend === 'bear' && a.score < 80) continue;
-    if (a.dir === 'short' && btcTrend === 'bull' && a.score < 80) continue;
+    // 量能太萎縮的訊號可靠性低（volSurge < 0.7 代表成交量剩 70% 以下）
+    if (a.flow5m?.volSurge < 0.7) { console.log(`⚡ ${pair} 量能萎縮(${a.flow5m.volSurge.toFixed(2)}x)，跳過`); continue; }
+    // BTC 趨勢過濾（更嚴格，提升勝率）
+    if (a.dir === 'long'  && btcTrend === 'bear' && a.score < 85) continue;
+    if (a.dir === 'short' && btcTrend === 'bull' && a.score < 85) continue;
     if (isOnCooldown(pair)) continue;
     if (isDuplicatePush(pair, a)) { console.log(`⏭ 重複略過 ${pair}`); continue; }
     validSignals.push({ pair, a });
@@ -736,11 +776,16 @@ async function _doScan() {
   }
  
   const { pair, a } = best;
-  const badge = a.score >= 80 ? '🔴 強訊號' : '🟡 中訊號';
+  const isStrong = a.score >= 80;
+  const badge = isStrong ? '🔴 強訊號' : '🟡 中訊號';
   const msg = buildTextSignal(pair, a, badge);
   console.log(`📤 推送 ${pair} ${badge} 評分${a.score}（${msg.length}字）`);
  
-  const ok = await linePush(msg);
+  // 做多綠色，做空紅色（強訊號飽和度高，中訊號較淡）
+  const color = a.dir === 'long'
+    ? (isStrong ? 0x00E578 : 0x00A854)   // 做多：亮綠/深綠
+    : (isStrong ? 0xFF4466 : 0xCC2244);  // 做空：亮紅/深紅
+  const ok = await discordPush(msg, true, color);
   if (ok) {
     markPushed(pair, a);
     pendingOrders[pair] = { pair, analysis: a, createdAt: Date.now() };
