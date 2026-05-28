@@ -343,7 +343,7 @@ function calcBollinger(candles, period = 20) {
 }
  
 function calc5mFlow(candles5m) {
-  if (!candles5m || candles5m.length < 5) return { bullRatio: 0.5, bearRatio: 0.5, volSurge: 1, avgVol: 0 };
+  if (!candles5m || candles5m.length < 5) return { bullRatio: 0.5, bearRatio: 0.5, volSurge: 1, avgVol: 0, rebound: false, breakdown: false };
   const r = candles5m.slice(0, 5);
   const bv = r.filter(c=>c.close>c.open).reduce((s,c)=>s+c.vol,0);
   const tot = r.reduce((s,c)=>s+c.vol,0);
@@ -351,7 +351,32 @@ function calc5mFlow(candles5m) {
   const avgVol = tot / r.length;
   const prev = candles5m.slice(5,10);
   const prevAvg = prev.length ? prev.reduce((s,c)=>s+c.vol,0)/prev.length : avgVol||1;
-  return { bullRatio, bearRatio: 1-bullRatio, volSurge: prevAvg>0?avgVol/prevAvg:1, avgVol };
+  const volSurge = prevAvg > 0 ? avgVol / prevAvg : 1;
+ 
+  // ── 強力反彈偵測（照片模式：急跌後爆量V型反轉）──
+  // 條件：前1根大跌 + 最新根爆量大陽線/長下影線
+  const c0 = candles5m[0]; // 最新根
+  const c1 = candles5m[1]; // 前一根
+  const c2 = candles5m[2]; // 前兩根
+  const range0 = c0.high - c0.low;
+  const body0  = Math.abs(c0.close - c0.open);
+  const lowerShadow0 = Math.min(c0.open, c0.close) - c0.low; // 下影線長度
+  const drop1  = c1.open > 0 ? (c1.open - c1.close) / c1.open : 0; // 前根跌幅
+  const volSpike = c1.vol > 0 ? c0.vol / c1.vol : 1;                // 量能爆增倍數
+ 
+  // 強力反彈：前根急跌(>1%) + 當根爆量(>1.5x) + 收陽或長下影線
+  const rebound = drop1 > 0.01
+    && volSpike > 1.5
+    && (c0.close > c0.open || lowerShadow0 > body0 * 0.8);
+ 
+  // 強力跌破：前根大漲 + 當根爆量大陰線
+  const rise1 = c1.open > 0 ? (c1.close - c1.open) / c1.open : 0;
+  const upperShadow0 = c0.high - Math.max(c0.open, c0.close);
+  const breakdown = rise1 > 0.01
+    && volSpike > 1.5
+    && (c0.close < c0.open || upperShadow0 > body0 * 0.8);
+ 
+  return { bullRatio, bearRatio: 1-bullRatio, volSurge, avgVol, rebound, breakdown };
 }
  
 // ── 做多評分 ───────────────────────────────────
@@ -386,6 +411,11 @@ function scoreLong(reasons, score, p) {
   if (rsiDiv === 'bullish')   { reasons.push({ t: 'RSI底背離',   ok: true }); score += 10; }
   if (isTrend) { if (ma10 > ma20 && macd.histogram > 0) score += 5; }
   else         { if (rsi < 35) score += 6; }
+ 
+  // ── 5m 強力反彈加分 ───────────────────────────────
+  if (flow5m.rebound) {
+    reasons.push({ t: '5m急跌爆量反彈🔥', ok: true }); score += 15;
+  }
  
   // ── 多指標共振加分（3個以上核心指標同向 +10）──
   const bullSignals = [
@@ -432,6 +462,11 @@ function scoreShort(reasons, score, p) {
   if (isTrend) { if (ma10 < ma20 && macd.histogram < 0) score += 5; }
   else         { if (rsi > 65) score += 6; }
  
+  // ── 5m 強力跌破加分 ───────────────────────────────
+  if (flow5m.breakdown) {
+    reasons.push({ t: '5m大漲爆量跌破🔥', ok: true }); score += 15;
+  }
+ 
   // ── 多指標共振加分（3個以上核心指標同向 +10）──
   const bearSignals = [
     macd.histogram < 0,
@@ -454,8 +489,17 @@ async function analyze(instId) {
     fetchCandles(instId, '1H', 50).catch(() => []),
     fetchCandles5m(instId).catch(() => []),
   ]);
-  // 現價直接從最新 K 線取，省去一次 Ticker API
   const ticker = candles.length ? { last: String(candles[0].close) } : null;
+ 
+  // ── 方案 A：4H K線（直接 axios，不佔 rateLimiter 配額）
+  let candles4h = [];
+  try {
+    const swapId = instId.endsWith('-SWAP') ? instId : instId.replace(/-USDT$/, '-USDT-SWAP');
+    const d4h = await axios.get('https://www.okx.com/api/v5/market/candles', {
+      params: { instId: swapId, bar: '4H', limit: 20 }, timeout: 8000
+    });
+    candles4h = d4h.data?.data?.map(c => ({ close:+c[4], high:+c[2], low:+c[3], open:+c[1], vol:+c[5] })) || [];
+  } catch (_) {}
  
   // ── 資料完整性檢查 ─────────────────────────────────
   if (!candles.length || candles.length < 25) {
@@ -485,7 +529,16 @@ async function analyze(instId) {
   const atr    = calcATR(candles);
   const boll   = calcBollinger(candles);
   const flow5m   = calc5mFlow(candles5m);
-  const { adx, isTrend, obvTrend, rsiDiv } = calcTrendSignals(candles); // 趨勢輔助指標
+  const { adx, isTrend, obvTrend, rsiDiv } = calcTrendSignals(candles);
+ 
+  // ── 方案 A：4H 趨勢方向判斷 ────────────────────────
+  let trend4h = 'neutral';
+  if (candles4h.length >= 10) {
+    const ma10_4h = candles4h.slice(0,10).reduce((s,c)=>s+c.close,0)/10;
+    const macd4h  = calcMACD(candles4h);
+    if (candles4h[0].close > ma10_4h && macd4h.histogram > 0) trend4h = 'bull';
+    else if (candles4h[0].close < ma10_4h && macd4h.histogram < 0) trend4h = 'bear';
+  } // 趨勢輔助指標
  
   const reasons = [];
   let score = 50, dir = 'neutral';
@@ -514,8 +567,20 @@ async function analyze(instId) {
   if (last.close > boll.upper)                             longPts  += 1;
   if (last.close < boll.lower)                             shortPts += 1;
  
-  if      (longPts  >= shortPts + 4) dir = 'long';  // 需要更明確的多頭信號
-  else if (shortPts >= longPts  + 4) dir = 'short'; // 需要更明確的空頭信號
+  if      (longPts  >= shortPts + 4) dir = 'long';
+  else if (shortPts >= longPts  + 4) dir = 'short';
+ 
+  // ── 方案 A：4H 共振加減分 ──────────────────────────
+  // 4H 和 1H 同向 → +15；反向 → -20（幾乎無法過門檻）
+  if (dir === 'long'  && trend4h === 'bull') score += 15;
+  if (dir === 'long'  && trend4h === 'bear') score -= 20;
+  if (dir === 'short' && trend4h === 'bear') score += 15;
+  if (dir === 'short' && trend4h === 'bull') score -= 20;
+  if (trend4h !== 'neutral') {
+    const label = trend4h === 'bull' ? '4H多頭共振✅' : '4H空頭共振✅';
+    const conflict = (dir==='long'&&trend4h==='bear')||(dir==='short'&&trend4h==='bull');
+    reasons.push({ t: conflict ? `4H方向衝突❌` : label, ok: !conflict });
+  }
  
   // ══════════════════════════════════════════════
   // 評分計算（呼叫獨立函式）
@@ -600,7 +665,7 @@ async function analyze(instId) {
     slAmount, tp1Amount, tp2Amount, tp3Amount, fee,
     doubleCapital, flow5m, rsi, macd, swapSz,
     currentPrice: currentPrice || entry,
-    adx, isTrend, mtfDir: mtf.mtfDir, obvTrend, rsiDiv, flow5m,
+    adx, isTrend, mtfDir: mtf.mtfDir, obvTrend, rsiDiv, flow5m, trend4h, atr: atr,
   };
 }
  
@@ -782,6 +847,11 @@ async function _doScan() {
     if (a.entry > 0 && slDist / a.entry > 0.03) { console.log(`🚫 ${pair} 止損過大(${(slDist/a.entry*100).toFixed(1)}%)，否決`); continue; }
     // D4：止損距離過小（slDist / entry < 0.2%，容易被掃）
     if (a.entry > 0 && slDist / a.entry < 0.002) { console.log(`🚫 ${pair} 止損過近(${(slDist/a.entry*100).toFixed(2)}%)，否決`); continue; }
+ 
+    // ── 方案 C：波動率過濾（ATR% 甜蜜區間）──────────
+    const atrPct = a.entry > 0 ? (a.atr || 0) / a.entry : 0;
+    if (atrPct < 0.003) { console.log(`🌙 ${pair} 波動率過低(${(atrPct*100).toFixed(2)}%)，盤整中跳過`); continue; }
+    if (atrPct > 0.04)  { console.log(`⚡ ${pair} 波動率過高(${(atrPct*100).toFixed(2)}%)，極端行情跳過`); continue; }
  
     if (isOnCooldown(pair)) continue;
     if (isDuplicatePush(pair, a)) { console.log(`⏭ 重複略過 ${pair}`); continue; }
