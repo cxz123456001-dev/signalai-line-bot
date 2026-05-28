@@ -533,10 +533,26 @@ async function analyze(instId) {
   score = Math.min(100, Math.max(0, score));
   const entry = last.close;
  
-  // ATR 動態倍數（低波動緊、高波動寬）
+  // ── 方案 B：關鍵價位止損 + ATR 保底 ─────────────
   const atrMult = getATRMultiplier(atr, candles);
-  const atrSL = atr * atrMult;
-  const sl = dir === 'long' ? entry - atrSL : entry + atrSL;
+  const atrSL   = atr * atrMult;
+  let sl;
+  if (dir === 'long') {
+    const keyLow  = Math.min(...prev10.map(c => c.low));  // 前10根最低點
+    const keyStop = keyLow  - atr * 0.3;                  // 下移緩衝
+    const atrStop = entry   - atrSL;
+    // 取較近的止損，但不超過 ATR 止損 1.5 倍，且至少距離 0.5 ATR
+    sl = Math.max(Math.max(keyStop, atrStop), entry - atrSL * 1.5);
+    sl = Math.min(sl, entry - atr * 0.5);
+  } else if (dir === 'short') {
+    const keyHigh = Math.max(...prev10.map(c => c.high)); // 前10根最高點
+    const keyStop = keyHigh + atr * 0.3;
+    const atrStop = entry   + atrSL;
+    sl = Math.min(Math.min(keyStop, atrStop), entry + atrSL * 1.5);
+    sl = Math.max(sl, entry + atr * 0.5);
+  } else {
+    sl = dir === 'long' ? entry - atrSL : entry + atrSL;
+  }
   const slDist = Math.abs(entry - sl);
  
   // 止盈分3等分
