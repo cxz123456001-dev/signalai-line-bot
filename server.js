@@ -857,7 +857,7 @@ function buildTextSignal(pair, a, badge) {
     const bad  = (a.reasons || []).filter(r => !r.ok).map(r => r.t).join(' · ');
     const price = a.currentPrice || a.entry || 0;
     return (
-      `${badge} **${sym}** ${dir}  評分 **${a.score}**/100  ${sessionTag}\n` +
+      `${badge} **${sym}** ${dir}  評分 **${a.score}**/100  ${(()=>{ const h=parseInt(new Date().toLocaleString('en-US',{timeZone:'Asia/Taipei',hour:'numeric',hour12:false})); return h>=21||h<5?'🇺🇸美國盤':h>=15?'🇪🇺歐洲盤':h>=8?'🌏亞洲盤':'🌙深夜'; })()}\n` +
       `RSI **${(a.rsi||0).toFixed(0)}** · ADX **${(a.adx||0).toFixed(0)}** · ${a.isTrend?'📊 趨勢':'〰️ 震盪'} · ${a.vwapPos||''}\n` +
       `──────────────\n` +
       `💹 現價：\`${fmt(price)}\`\n` +
@@ -906,9 +906,9 @@ async function _doScan() {
     const pair = WATCH_PAIRS[i];
     const r = await analyze(pair).then(a => ({ pair, a })).catch(e => ({ status:'rejected', reason:e }));
     results.push({ status: 'fulfilled', value: r });
-    // 每幣掃完後休息 1 秒（2次API × 800ms + 緩衝）
+    // 每幣掃完後休息 600ms（4H axios + 2次API × 800ms + 緩衝）
     if (i < WATCH_PAIRS.length - 1) {
-      await new Promise(r => setTimeout(r, 1000));
+      await new Promise(r => setTimeout(r, 600));
     }
   }
  
@@ -993,9 +993,6 @@ async function _doScan() {
     skipped.forEach(s => recordSignal(s.pair, s.a.score, s.a.dir));
   }
   console.log(`📊 本輪推送：強${strong.length}個 中${Math.min(medium.length,2)}個`);
- 
-  const twH = parseInt(new Date().toLocaleString('en-US', { timeZone:'Asia/Taipei', hour:'numeric', hour12:false }));
-  const sessionTag = twH >= 21 || twH < 5 ? '🇺🇸美國盤' : twH >= 15 ? '🇪🇺歐洲盤' : twH >= 8 ? '🌏亞洲盤' : '🌙深夜';
  
   for (let si = 0; si < toSend.length; si++) {
     const { pair, a } = toSend[si];
@@ -1242,7 +1239,7 @@ app.listen(PORT, async () => {
   let lastCronAt = Date.now();
   setInterval(() => {
     const elapsed = (Date.now() - lastCronAt) / 1000;
-    if (elapsed > 5 * 60) {
+    if (elapsed > 10 * 60) {
       console.warn(`⚠️ Watchdog：${Math.floor(elapsed)}s 未掃描，強制觸發`);
       lastCronAt = Date.now();
       scanAndPush().catch(e => console.error('Watchdog 觸發失敗:', e.message));
