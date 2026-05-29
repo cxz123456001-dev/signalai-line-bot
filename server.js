@@ -118,7 +118,7 @@ const markPushed = (pair, a) => recentPushes.set(pair, { dir: a.dir, entry: a.en
  
 // ── 方案B：冷卻機制 ─────────────────────────────────
 const signalCooldown = new Map();
-const COOLDOWN_MS = 30 * 60 * 1000;
+const COOLDOWN_MS = 20 * 60 * 1000; // V1：縮短冷卻至 20 分鐘
 const isOnCooldown = pair => { const t = signalCooldown.get(pair); return t && Date.now()-t < COOLDOWN_MS; };
 const setCooldown = pair => signalCooldown.set(pair, Date.now());
  
@@ -656,15 +656,15 @@ async function analyze(instId) {
   if (last.close > boll.upper)                             longPts  += 1;
   if (last.close < boll.lower)                             shortPts += 1;
  
-  if      (longPts  >= shortPts + 4) dir = 'long';
-  else if (shortPts >= longPts  + 4) dir = 'short';
+  if      (longPts  >= shortPts + 3) dir = 'long';  // V1：放寬至 3
+  else if (shortPts >= longPts  + 3) dir = 'short';
  
   // ── 方案 A：4H 共振加減分 ──────────────────────────
   // 4H 和 1H 同向 → +15；反向 → -20（幾乎無法過門檻）
   if (dir === 'long'  && trend4h === 'bull') score += 15;
-  if (dir === 'long'  && trend4h === 'bear') score -= 20;
+  if (dir === 'long'  && trend4h === 'bear') score -= 12; // V1：-20→-12
   if (dir === 'short' && trend4h === 'bear') score += 15;
-  if (dir === 'short' && trend4h === 'bull') score -= 20;
+  if (dir === 'short' && trend4h === 'bull') score -= 12; // V1：-20→-12
   if (trend4h !== 'neutral') {
     const label = trend4h === 'bull' ? '4H多頭共振✅' : '4H空頭共振✅';
     const conflict = (dir==='long'&&trend4h==='bear')||(dir==='short'&&trend4h==='bull');
@@ -975,35 +975,41 @@ async function _doScan() {
  
   if (pushable.length === 0) { console.log('⚪ 本輪無有效訊號'); return; }
  
-  // 只推送評分最高的一個
+  // V1：強訊號全推，中訊號最多推 2 個
   pushable.sort((x, y) => y.a.score - x.a.score);
-  const best = pushable[0];
-  if (pushable.length > 1) {
-    const others = pushable.slice(1).map(s => `${s.pair.replace('-USDT','')}(${s.a.score})`).join(' ');
-    console.log(`  其他訊號略過：${others}`);
-    pushable.slice(1).forEach(s => recordSignal(s.pair, s.a.score, s.a.dir));
+  const strong = pushable.filter(s => s.a.score >= 80);
+  const medium = pushable.filter(s => s.a.score < 80);
+  // 強訊號全推，中訊號只取前 2
+  const toSend = [...strong, ...medium.slice(0, 2)];
+  const skipped = medium.slice(2);
+  if (skipped.length > 0) {
+    console.log(`  略過低分訊號：${skipped.map(s=>`${s.pair.replace('-USDT','')}(${s.a.score})`).join(' ')}`);
+    skipped.forEach(s => recordSignal(s.pair, s.a.score, s.a.dir));
   }
+  console.log(`📊 本輪推送：強${strong.length}個 中${Math.min(medium.length,2)}個`);
  
-  const { pair, a } = best;
-  const isStrong = a.score >= 80;
-  const badge = isStrong ? '🔴 強訊號' : '🟡 中訊號';
-  // 時段標示
   const twH = parseInt(new Date().toLocaleString('en-US', { timeZone:'Asia/Taipei', hour:'numeric', hour12:false }));
   const sessionTag = twH >= 21 || twH < 5 ? '🇺🇸美國盤' : twH >= 15 ? '🇪🇺歐洲盤' : twH >= 8 ? '🌏亞洲盤' : '🌙深夜';
-  const msg = buildTextSignal(pair, a, badge);
-  console.log(`📤 推送 ${pair} ${badge} 評分${a.score}（${msg.length}字）`);
  
-  // 做多綠色，做空紅色（強訊號飽和度高，中訊號較淡）
-  const color = a.dir === 'long'
-    ? (isStrong ? 0x00E578 : 0x00A854)   // 做多：亮綠/深綠
-    : (isStrong ? 0xFF4466 : 0xCC2244);  // 做空：亮紅/深紅
-  const ok = await discordPush(msg, true, color);
-  if (ok) {
-    markPushed(pair, a);
-    pendingOrders[pair] = { pair, analysis: a, createdAt: Date.now() };
-    setCooldown(pair);
-    recordSignal(pair, a.score, a.dir);
-    console.log(`✅ 推送完成：${pair}`);
+  for (const { pair, a } of toSend) {
+    const isStrong = a.score >= 80;
+    const badge = isStrong ? '🔴 強訊號' : '🟡 中訊號';
+    const msg = buildTextSignal(pair, a, badge);
+    console.log(`📤 推送 ${pair} ${badge} 評分${a.score}（${msg.length}字）`);
+    const color = a.dir === 'long'
+      ? (isStrong ? 0x00E578 : 0x00A854)
+      : (isStrong ? 0xFF4466 : 0xCC2244);
+    const ok = await discordPush(msg, true, color);
+    if (ok) {
+      markPushed(pair, a);
+      pendingOrders[pair] = { pair, analysis: a, createdAt: Date.now() };
+      setCooldown(pair);
+      recordSignal(pair, a.score, a.dir);
+      console.log(`✅ 推送完成：${pair}`);
+    }
+    // 多個訊號間隔 1 秒避免 Discord Webhook 限速
+    // 訊號間隔 1 秒
+    await new Promise(r => setTimeout(r, 1000));
   }
 }
  
