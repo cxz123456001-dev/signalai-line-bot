@@ -93,10 +93,13 @@ const FIXED_PAIRS = [
   'BTC-USDT','ETH-USDT','SOL-USDT','BNB-USDT',
   // 主流山寨（成交量大）
   'XRP-USDT','ADA-USDT','AVAX-USDT','TRX-USDT',
-  // 高波動標的
+  // 高波動生態（DeFi / Layer2）
   'LINK-USDT','DOT-USDT','SUI-USDT','NEAR-USDT',
   // 迷因幣（高波動）
   'DOGE-USDT','PEPE-USDT','WIF-USDT','BONK-USDT',
+  // V2 新增：熱門 Layer2 / DeFi / 新興生態
+  'OP-USDT','ARB-USDT','INJ-USDT','TIA-USDT',
+  'ONDO-USDT','JTO-USDT','EIGEN-USDT','W-USDT',
 ];
  
  
