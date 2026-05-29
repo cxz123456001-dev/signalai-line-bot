@@ -662,13 +662,13 @@ async function analyze(instId) {
   // ── 方案 A：4H 共振加減分 ──────────────────────────
   // 4H 和 1H 同向 → +15；反向 → -20（幾乎無法過門檻）
   if (dir === 'long'  && trend4h === 'bull') score += 15;
-  if (dir === 'long'  && trend4h === 'bear') score -= 12; // V1：-20→-12
+  // #5 校準：4H 衝突直接標記，評分後在 _doScan 過濾
+  if (dir === 'long'  && trend4h === 'bear') score -= 12;
   if (dir === 'short' && trend4h === 'bear') score += 15;
-  if (dir === 'short' && trend4h === 'bull') score -= 12; // V1：-20→-12
+  if (dir === 'short' && trend4h === 'bull') score -= 12;
   if (trend4h !== 'neutral') {
-    const label = trend4h === 'bull' ? '4H多頭共振✅' : '4H空頭共振✅';
     const conflict = (dir==='long'&&trend4h==='bear')||(dir==='short'&&trend4h==='bull');
-    reasons.push({ t: conflict ? `4H方向衝突❌` : label, ok: !conflict });
+    reasons.push({ t: conflict ? '4H方向衝突❌' : (trend4h==='bull'?'4H多頭共振✅':'4H空頭共振✅'), ok: !conflict });
   }
  
   // ══════════════════════════════════════════════
@@ -687,7 +687,7 @@ async function analyze(instId) {
   // ── W1：評分正規化（原始分 → 0~100 標準分）──────────
   // 最低有意義分 = 35（neutral），最高理論值 ≈ 220
   const rawScore = score;
-  score = Math.round(Math.min(100, Math.max(0, (rawScore - 35) / 185 * 100)));
+  score = Math.round(Math.min(100, Math.max(0, (rawScore - 35) / 140 * 100))); // #2 校準：/185→/140
   const entry = last.close;
  
   // ── 方案 B：關鍵價位止損 + ATR 保底 ─────────────
@@ -920,11 +920,17 @@ async function _doScan() {
     const { pair, a } = res.value;
     if (!a || a.dir === 'neutral') continue;
     if (a.score < MIN_SCORE) { if (a.score >= 50) recordSignal(pair, a.score, a.dir); continue; }
-    // 量能太萎縮的訊號可靠性低
-    if (a.flow5m?.volSurge < 0.7) { console.log(`⚡ ${pair} 量能萎縮(${a.flow5m.volSurge.toFixed(2)}x)，跳過`); continue; }
+    // #4 過濾：volSurge 依幣種分層（迷因幣放寬）
+    const memePairs = ['DOGE-USDT','PEPE-USDT','WIF-USDT','BONK-USDT','SHIB-USDT','FLOKI-USDT'];
+    const volSurgeMin = memePairs.includes(pair) ? 0.5 : 0.7;
+    if (a.flow5m?.volSurge < volSurgeMin) { console.log(`⚡ ${pair} 量能萎縮(${a.flow5m.volSurge.toFixed(2)}x < ${volSurgeMin})，跳過`); continue; }
     // BTC 趨勢過濾
     if (a.dir === 'long'  && btcTrend === 'bear' && a.score < 85) continue;
     if (a.dir === 'short' && btcTrend === 'bull' && a.score < 85) continue;
+    // #5 校準：4H 衝突直接跳過（reasons 有「4H方向衝突❌」的不推送）
+    if (a.reasons?.some(r => r.t === '4H方向衝突❌')) {
+      console.log(`↩️ ${pair} 4H方向衝突，跳過`); continue;
+    }
  
     // ── 方案 D：否決條件（硬性過濾，不管評分多高）──────
     const atr = a.atr || 0;
@@ -991,7 +997,8 @@ async function _doScan() {
   const twH = parseInt(new Date().toLocaleString('en-US', { timeZone:'Asia/Taipei', hour:'numeric', hour12:false }));
   const sessionTag = twH >= 21 || twH < 5 ? '🇺🇸美國盤' : twH >= 15 ? '🇪🇺歐洲盤' : twH >= 8 ? '🌏亞洲盤' : '🌙深夜';
  
-  for (const { pair, a } of toSend) {
+  for (let si = 0; si < toSend.length; si++) {
+    const { pair, a } = toSend[si];
     const isStrong = a.score >= 80;
     const badge = isStrong ? '🔴 強訊號' : '🟡 中訊號';
     const msg = buildTextSignal(pair, a, badge);
@@ -1007,9 +1014,8 @@ async function _doScan() {
       recordSignal(pair, a.score, a.dir);
       console.log(`✅ 推送完成：${pair}`);
     }
-    // 多個訊號間隔 1 秒避免 Discord Webhook 限速
-    // 訊號間隔 1 秒
-    await new Promise(r => setTimeout(r, 1000));
+    // #3 效能：最後一個訊號不等待
+    if (si < toSend.length - 1) await new Promise(r => setTimeout(r, 1000));
   }
 }
  
@@ -1209,7 +1215,9 @@ cron.schedule('0 0 * * *', () => {
   dailyStats.isFused   = false;
   dailyStats.signals   = [];
   dailyStats.date      = new Date().toLocaleDateString('zh-TW', { timeZone: 'Asia/Taipei' });
-  console.log('🔄 每日統計重置完成');
+  recentPushes.clear(); // #1 BUG：清除跨日去重快取
+  signalCooldown.clear(); // 同時清除冷卻，讓每天從新開始
+  console.log('🔄 每日重置：統計/去重快取/冷卻 全部清除');
 }, { timezone: 'Asia/Taipei' });
  
 // ══════════════════════════════════════════════
