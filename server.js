@@ -38,6 +38,19 @@ async function discordPush(text, isSignal = false, color = 0x00CFFF) {
         await new Promise(r => setTimeout(r, i * 3000));
       } else {
         console.error(`❌ Discord 推送放棄 [${status||e.code}]: ${e.message}`);
+        // #5 備援：Discord 全部失敗時嘗試 LINE 簡短通知
+        if (isSignal && process.env.LINE_USER_ID && process.env.LINE_CHANNEL_ACCESS_TOKEN) {
+          try {
+            const shortMsg = text.split('\n').slice(0, 3).join('\n') + '\n⚠️ Discord 暫時斷線';
+            await axios.post('https://api.line.me/v2/bot/message/push',
+              { to: process.env.LINE_USER_ID, messages: [{ type: 'text', text: shortMsg }] },
+              { headers: { 'Content-Type': 'application/json',
+                  Authorization: `Bearer ${process.env.LINE_CHANNEL_ACCESS_TOKEN}` },
+                timeout: 10000 }
+            );
+            console.log('📱 LINE 備援推送成功');
+          } catch (_) { console.error('❌ LINE 備援也失敗'); }
+        }
         return false;
       }
     }
@@ -233,6 +246,38 @@ function getATRMultiplier(atr, candles) {
 // 全域 API 限速器（最多 8 次/秒，OKX 上限20次/秒）
 // 所有 OKX API 呼叫都必須通過此限速器
 // ══════════════════════════════════════════════
+// ── 4H / 15m K線快取（減少 API 呼叫）────────────────
+const cache4h  = new Map(); // instId → { candles, ts }
+const cache15m = new Map(); // instId → { candles, ts }
+ 
+async function fetchCached4H(instId) {
+  const cached = cache4h.get(instId);
+  if (cached && Date.now() - cached.ts < 4 * 60 * 60 * 1000) return cached.candles;
+  try {
+    const swapId = instId.endsWith('-SWAP') ? instId : instId.replace(/-USDT$/, '-USDT-SWAP');
+    const { data } = await axios.get('https://www.okx.com/api/v5/market/candles', {
+      params: { instId: swapId, bar: '4H', limit: 20 }, timeout: 8000
+    });
+    const candles = data?.data?.map(c => ({ close:+c[4], high:+c[2], low:+c[3], open:+c[1], vol:+c[5] })) || [];
+    if (candles.length) cache4h.set(instId, { candles, ts: Date.now() });
+    return candles;
+  } catch (_) { return cache4h.get(instId)?.candles || []; }
+}
+ 
+async function fetchCached15m(instId) {
+  const cached = cache15m.get(instId);
+  if (cached && Date.now() - cached.ts < 15 * 60 * 1000) return cached.candles;
+  try {
+    const swapId = instId.endsWith('-SWAP') ? instId : instId.replace(/-USDT$/, '-USDT-SWAP');
+    const { data } = await axios.get('https://www.okx.com/api/v5/market/candles', {
+      params: { instId: swapId, bar: '15m', limit: 30 }, timeout: 8000
+    });
+    const candles = data?.data?.map(c => ({ close:+c[4], high:+c[2], low:+c[3], open:+c[1], vol:+c[5] })) || [];
+    if (candles.length) cache15m.set(instId, { candles, ts: Date.now() });
+    return candles;
+  } catch (_) { return cache15m.get(instId)?.candles || []; }
+}
+ 
 const rateLimiter = {
   queue: [],
   running: 0,
@@ -593,25 +638,11 @@ async function analyze(instId) {
   ]);
   const ticker = candles.length ? { last: String(candles[0].close) } : null;
  
-  // ── 方案 A：4H K線（直接 axios，不佔 rateLimiter 配額）
-  let candles4h = [];
-  try {
-    const swapId = instId.endsWith('-SWAP') ? instId : instId.replace(/-USDT$/, '-USDT-SWAP');
-    const d4h = await axios.get('https://www.okx.com/api/v5/market/candles', {
-      params: { instId: swapId, bar: '4H', limit: 20 }, timeout: 8000
-    });
-    candles4h = d4h.data?.data?.map(c => ({ close:+c[4], high:+c[2], low:+c[3], open:+c[1], vol:+c[5] })) || [];
-  } catch (_) {}
- 
-  // ── T4：15m K線（直接 axios，捕捉短線進場時機）─────
-  let candles15m = [];
-  try {
-    const swapId15 = instId.endsWith('-SWAP') ? instId : instId.replace(/-USDT$/, '-USDT-SWAP');
-    const d15 = await axios.get('https://www.okx.com/api/v5/market/candles', {
-      params: { instId: swapId15, bar: '15m', limit: 30 }, timeout: 8000
-    });
-    candles15m = d15.data?.data?.map(c => ({ close:+c[4], high:+c[2], low:+c[3], open:+c[1], vol:+c[5] })) || [];
-  } catch (_) {}
+  // ── 4H / 15m K線（快取版，大幅減少 API 呼叫）─────
+  const [candles4h, candles15m] = await Promise.all([
+    fetchCached4H(instId),
+    fetchCached15m(instId),
+  ]);
  
   // ── 資料完整性檢查 ─────────────────────────────────
   if (!candles.length || candles.length < 25) {
@@ -1047,7 +1078,7 @@ app.get('/health', (req, res) => res.json({
 // ══════════════════════════════════════════════
 // 定時任務
 // ══════════════════════════════════════════════
-cron.schedule('*/2 * * * *', scanAndPush); // T5：縮短至 2 分鐘
+cron.schedule('*/2 * * * *', scanAndPush); // 加快取後 ~74 秒/輪，2 分鐘有 46 秒緩衝
 cron.schedule('*/15 * * * *', () => updateBtcTrend().catch(()=>{})); // BTC趨勢每15分鐘
  
 // 每天 00:00 重置每日統計與熔斷
@@ -1056,8 +1087,10 @@ cron.schedule('0 0 * * *', () => {
   dailyStats.isFused   = false;
   dailyStats.signals   = [];
   dailyStats.date      = new Date().toLocaleDateString('zh-TW', { timeZone: 'Asia/Taipei' });
-  recentPushes.clear(); // #1 BUG：清除跨日去重快取
-  signalCooldown.clear(); // 同時清除冷卻，讓每天從新開始
+  recentPushes.clear();   // 清除跨日去重快取
+  signalCooldown.clear();  // 清除冷卻
+  cache4h.clear();         // 清除 4H K線快取
+  cache15m.clear();        // 清除 15m K線快取
   console.log('🔄 每日重置：統計/去重快取/冷卻 全部清除');
 }, { timezone: 'Asia/Taipei' });
  
