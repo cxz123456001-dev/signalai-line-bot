@@ -681,7 +681,10 @@ async function analyze(instId) {
     score = 35;
   }
  
-  score = Math.min(100, Math.max(0, score));
+  // ── W1：評分正規化（原始分 → 0~100 標準分）──────────
+  // 最低有意義分 = 35（neutral），最高理論值 ≈ 220
+  const rawScore = score;
+  score = Math.round(Math.min(100, Math.max(0, (rawScore - 35) / 185 * 100)));
   const entry = last.close;
  
   // ── 方案 B：關鍵價位止損 + ATR 保底 ─────────────
@@ -851,7 +854,7 @@ function buildTextSignal(pair, a, badge) {
     const bad  = (a.reasons || []).filter(r => !r.ok).map(r => r.t).join(' · ');
     const price = a.currentPrice || a.entry || 0;
     return (
-      `${badge} **${sym}** ${dir}  評分 **${a.score}**/100\n` +
+      `${badge} **${sym}** ${dir}  評分 **${a.score}**/100  ${sessionTag}\n` +
       `RSI **${(a.rsi||0).toFixed(0)}** · ADX **${(a.adx||0).toFixed(0)}** · ${a.isTrend?'📊 趨勢':'〰️ 震盪'} · ${a.vwapPos||''}\n` +
       `──────────────\n` +
       `💹 現價：\`${fmt(price)}\`\n` +
@@ -921,11 +924,25 @@ async function _doScan() {
     if (a.dir === 'short' && btcTrend === 'bull' && a.score < 85) continue;
  
     // ── 方案 D：否決條件（硬性過濾，不管評分多高）──────
-    const rsi = a.rsi || 50;
     const atr = a.atr || 0;
     const slDist = Math.abs(a.entry - a.sl);
     const candleRange = a.entry * 0.02; // 近似
+    // ── W4：時段動態門檻 ─────────────────────────────
+    const twHour = new Date().toLocaleString('en-US', { timeZone: 'Asia/Taipei', hour: 'numeric', hour12: false });
+    const h = parseInt(twHour);
+    let sessionMinScore = MIN_SCORE;
+    if (h >= 8 && h < 16) {
+      // 亞洲盤：成交量低、假突破多 → 門檻提高 +5
+      sessionMinScore = MIN_SCORE + 5;
+      if (a.score < sessionMinScore) { console.log(`🌏 ${pair} 亞洲盤門檻(${sessionMinScore})未達，跳過`); continue; }
+    } else if (h >= 21 || h < 5) {
+      // 美國盤：成交量最大、機構主導 → 門檻降低 -3
+      sessionMinScore = Math.max(MIN_SCORE - 3, 60);
+    }
+    // （歐洲盤 16-21 使用標準門檻）
+ 
     // D1：RSI 極端值（做多時過熱，做空時過賣）
+    const rsi = a.rsi || 50;
     if (a.dir === 'long'  && rsi > 75) { console.log(`🚫 ${pair} RSI過熱(${rsi.toFixed(0)})，否決做多`); continue; }
     if (a.dir === 'short' && rsi < 25) { console.log(`🚫 ${pair} RSI過賣(${rsi.toFixed(0)})，否決做空`); continue; }
     // D2：成交量極度萎縮（volSurge < 0.5，假突破風險極高）
@@ -967,6 +984,9 @@ async function _doScan() {
   const { pair, a } = best;
   const isStrong = a.score >= 80;
   const badge = isStrong ? '🔴 強訊號' : '🟡 中訊號';
+  // 時段標示
+  const twH = parseInt(new Date().toLocaleString('en-US', { timeZone:'Asia/Taipei', hour:'numeric', hour12:false }));
+  const sessionTag = twH >= 21 || twH < 5 ? '🇺🇸美國盤' : twH >= 15 ? '🇪🇺歐洲盤' : twH >= 8 ? '🌏亞洲盤' : '🌙深夜';
   const msg = buildTextSignal(pair, a, badge);
   console.log(`📤 推送 ${pair} ${badge} 評分${a.score}（${msg.length}字）`);
  
@@ -1043,6 +1063,7 @@ app.post('/webhook', middleware(lineConfig), async (req, res) => {
           `⚡ 門檻：${MIN_SCORE}分 | 止損上限 $${MAX_LOSS_USDT}\n` +
           `💰 本金：$${BASE_CAPITAL}\n\n` +
           `Discord: ${DISCORD_WEBHOOK ? '✅ 已設定' : '❌ 未設定'}\n` +
+          `⏰ 時段門檻：亞洲盤 ${MIN_SCORE+5}分 / 歐洲盤 ${MIN_SCORE}分 / 美國盤 ${Math.max(MIN_SCORE-3,60)}分\n` +
           `指令：掃描 / 幣對 / 報告 / 清除冷卻 / 重置熔斷`
       });
     } else if (text === '幣對') {
