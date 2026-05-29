@@ -57,7 +57,6 @@ const FUND_RATE_LIMIT = parseFloat(process.env.FUND_RATE_LIMIT|| '0.0008'); // �
  
 // ══════════════════════════════════════════════
 // OKX 下單功能已停用（觀察期）
-const DEFAULT_LEVER = parseInt(process.env.DEFAULT_LEVER || '10');
  
 const toSwap = id => id.endsWith('-SWAP') ? id : id + '-SWAP';
  
