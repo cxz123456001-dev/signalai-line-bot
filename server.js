@@ -118,7 +118,7 @@ const markPushed = (pair, a) => recentPushes.set(pair, { dir: a.dir, entry: a.en
  
 // ── 方案B：冷卻機制 ─────────────────────────────────
 const signalCooldown = new Map();
-const COOLDOWN_MS = 20 * 60 * 1000; // V1：縮短冷卻至 20 分鐘
+const COOLDOWN_MS = 15 * 60 * 1000; // T3：縮短冷卻至 15 分鐘
 const isOnCooldown = pair => { const t = signalCooldown.get(pair); return t && Date.now()-t < COOLDOWN_MS; };
 const setCooldown = pair => signalCooldown.set(pair, Date.now());
  
@@ -397,7 +397,7 @@ function calc5mFlow(candles5m) {
  
 // ── 做多評分 ───────────────────────────────────
 function scoreLong(reasons, score, p) {
-  const { last, resistance, support, rsi, macd, boll, ma10, ma20, ma50, flow5m, volRatio, isCandle_bull, bodyRatio, mtf, obvTrend, rsiDiv, isTrend, vwap, adx } = p;
+  const { last, resistance, support, rsi, macd, boll, ma10, ma20, ma50, flow5m, volRatio, isCandle_bull, bodyRatio, mtf, obvTrend, rsiDiv, isTrend, vwap, adx, signal15m, mom15m } = p;
   if (last.close > resistance && volRatio > 1.2) {
     reasons.push({ t: `突破${fmt(resistance)}阻力`, ok: true }); score += 18;
   }
@@ -431,6 +431,14 @@ function scoreLong(reasons, score, p) {
   // ── 5m 強力反彈加分 ───────────────────────────────
   if (flow5m.rebound) {
     reasons.push({ t: '5m急跌爆量反彈🔥', ok: true }); score += 15;
+  }
+ 
+  // ── T4：15m 動能確認加分 ─────────────────────────
+  if (signal15m === 'bull') {
+    reasons.push({ t: `15m多頭動能${mom15m > 5 ? '強🔥' : ''}`, ok: true });
+    score += mom15m > 5 ? 12 : 7;
+  } else if (signal15m === 'bear') {
+    reasons.push({ t: '15m空頭動能', ok: false }); score -= 8;
   }
  
   // ── 多指標共振加分（3個以上核心指標同向 +10）──
@@ -488,7 +496,7 @@ function scoreLong(reasons, score, p) {
  
 // ── 做空評分 ───────────────────────────────────
 function scoreShort(reasons, score, p) {
-  const { last, support, rsi, macd, boll, ma10, ma20, ma50, flow5m, volRatio, isCandle_bull, bodyRatio, mtf, obvTrend, rsiDiv, isTrend, vwap, adx } = p;
+  const { last, support, rsi, macd, boll, ma10, ma20, ma50, flow5m, volRatio, isCandle_bull, bodyRatio, mtf, obvTrend, rsiDiv, isTrend, vwap, adx, signal15m, mom15m } = p;
   if (last.close < support && volRatio > 1.2) {
     reasons.push({ t: `跌破${fmt(support)}支撐`, ok: true }); score += 18;
   }
@@ -519,6 +527,14 @@ function scoreShort(reasons, score, p) {
   // ── 5m 強力跌破加分 ───────────────────────────────
   if (flow5m.breakdown) {
     reasons.push({ t: '5m大漲爆量跌破🔥', ok: true }); score += 15;
+  }
+ 
+  // ── T4：15m 動能確認加分 ─────────────────────────
+  if (signal15m === 'bear') {
+    reasons.push({ t: `15m空頭動能${mom15m < -5 ? '強🔥' : ''}`, ok: true });
+    score += Math.abs(mom15m) > 5 ? 12 : 7;
+  } else if (signal15m === 'bull') {
+    reasons.push({ t: '15m多頭動能', ok: false }); score -= 8;
   }
  
   // ── 多指標共振加分（3個以上核心指標同向 +10）──
@@ -589,6 +605,16 @@ async function analyze(instId) {
     candles4h = d4h.data?.data?.map(c => ({ close:+c[4], high:+c[2], low:+c[3], open:+c[1], vol:+c[5] })) || [];
   } catch (_) {}
  
+  // ── T4：15m K線（直接 axios，捕捉短線進場時機）─────
+  let candles15m = [];
+  try {
+    const swapId15 = instId.endsWith('-SWAP') ? instId : instId.replace(/-USDT$/, '-USDT-SWAP');
+    const d15 = await axios.get('https://www.okx.com/api/v5/market/candles', {
+      params: { instId: swapId15, bar: '15m', limit: 30 }, timeout: 8000
+    });
+    candles15m = d15.data?.data?.map(c => ({ close:+c[4], high:+c[2], low:+c[3], open:+c[1], vol:+c[5] })) || [];
+  } catch (_) {}
+ 
   // ── 資料完整性檢查 ─────────────────────────────────
   if (!candles.length || candles.length < 25) {
     throw new Error(`K線資料不足（${candles.length} 根）`);
@@ -618,6 +644,22 @@ async function analyze(instId) {
   const boll   = calcBollinger(candles);
   const vwap   = calcVWAP(candles); // W2: VWAP
   const flow5m   = calc5mFlow(candles5m);
+ 
+  // ── T4：15m 指標計算 ─────────────────────────────────
+  let signal15m = 'neutral'; // 'bull' | 'bear' | 'neutral'
+  let mom15m = 0; // 15m 動能分數（-10 ~ +10）
+  if (candles15m.length >= 15) {
+    const rsi15   = calcRSI(candles15m);
+    const macd15  = calcMACD(candles15m);
+    const ma5_15  = candles15m.slice(0,5).reduce((s,c)=>s+c.close,0)/5;
+    const ma10_15 = candles15m.slice(0,10).reduce((s,c)=>s+c.close,0)/10;
+    // 15m 趨勢判斷
+    if (rsi15 < 45 && macd15.histogram < 0 && ma5_15 < ma10_15) {
+      signal15m = 'bear'; mom15m = -1 * Math.min(10, Math.abs(macd15.histogram / candles15m[0].close * 10000));
+    } else if (rsi15 > 55 && macd15.histogram > 0 && ma5_15 > ma10_15) {
+      signal15m = 'bull'; mom15m = Math.min(10, macd15.histogram / candles15m[0].close * 10000);
+    }
+  }
   const { adx, isTrend, obvTrend, rsiDiv } = calcTrendSignals(candles);
  
   // ── 方案 A：4H 趨勢方向判斷 ────────────────────────
@@ -675,9 +717,9 @@ async function analyze(instId) {
   // 評分計算（呼叫獨立函式）
   // ══════════════════════════════════════════════
   if (dir === 'long') {
-    score = scoreLong(reasons, score, { last, resistance, support, rsi, macd, boll, ma10, ma20, ma50, flow5m, volRatio, isCandle_bull, bodyRatio, mtf, obvTrend, rsiDiv, isTrend, vwap, adx });
+    score = scoreLong(reasons, score, { last, resistance, support, rsi, macd, boll, ma10, ma20, ma50, flow5m, volRatio, isCandle_bull, bodyRatio, mtf, obvTrend, rsiDiv, isTrend, vwap, adx, signal15m, mom15m });
   } else if (dir === 'short') {
-    score = scoreShort(reasons, score, { last, resistance, support, rsi, macd, boll, ma10, ma20, ma50, flow5m, volRatio, isCandle_bull, bodyRatio, mtf, obvTrend, rsiDiv, isTrend, vwap, adx });
+    score = scoreShort(reasons, score, { last, resistance, support, rsi, macd, boll, ma10, ma20, ma50, flow5m, volRatio, isCandle_bull, bodyRatio, mtf, obvTrend, rsiDiv, isTrend, vwap, adx, signal15m, mom15m });
   } else {
     reasons.push({ t: `RSI中性(${rsi.toFixed(0)})`, ok: false });
     reasons.push({ t: 'MACD方向不明', ok: false });
@@ -757,7 +799,7 @@ async function analyze(instId) {
     slAmount, tp1Amount, tp2Amount, tp3Amount, fee,
     doubleCapital, flow5m, rsi, macd, swapSz,
     currentPrice: currentPrice || entry,
-    adx, isTrend, mtfDir: mtf.mtfDir, obvTrend, rsiDiv, flow5m, trend4h, atr: atr, vwap,
+    adx, isTrend, mtfDir: mtf.mtfDir, obvTrend, rsiDiv, flow5m, trend4h, atr: atr, vwap, signal15m,
     vwapPos: vwap > 0 ? (last.close > vwap * 1.003 ? '🔼VWAP上' : last.close < vwap * 0.997 ? '🔽VWAP下' : '↔️VWAP中') : '',
   };
 }
@@ -858,7 +900,7 @@ function buildTextSignal(pair, a, badge) {
     const price = a.currentPrice || a.entry || 0;
     return (
       `${badge} **${sym}** ${dir}  評分 **${a.score}**/100  ${(()=>{ const h=parseInt(new Date().toLocaleString('en-US',{timeZone:'Asia/Taipei',hour:'numeric',hour12:false})); return h>=21||h<5?'🇺🇸美國盤':h>=15?'🇪🇺歐洲盤':h>=8?'🌏亞洲盤':'🌙深夜'; })()}\n` +
-      `RSI **${(a.rsi||0).toFixed(0)}** · ADX **${(a.adx||0).toFixed(0)}** · ${a.isTrend?'📊 趨勢':'〰️ 震盪'} · ${a.vwapPos||''}\n` +
+      `RSI **${(a.rsi||0).toFixed(0)}** · ADX **${(a.adx||0).toFixed(0)}** · ${a.isTrend?'📊 趨勢':'〰️ 震盪'} · ${a.vwapPos||''} · 15m${a.signal15m==='bull'?' 📈':a.signal15m==='bear'?' 📉':' ➡️'}\n` +
       `──────────────\n` +
       `💹 現價：\`${fmt(price)}\`\n` +
       `🟢 進場：\`${fmt(a.entry||0)}\`  ⚡${a.leverage||1}x\n` +
@@ -1189,7 +1231,7 @@ app.get('/health', (req, res) => res.json({
 // ══════════════════════════════════════════════
 // 定時任務
 // ══════════════════════════════════════════════
-cron.schedule('*/3 * * * *', scanAndPush);
+cron.schedule('*/2 * * * *', scanAndPush); // T5：縮短至 2 分鐘
 cron.schedule('*/15 * * * *', () => updateBtcTrend().catch(()=>{})); // BTC趨勢每15分鐘
  
 // 每 30 分鐘清除超過 2 小時的過期待確認訂單
