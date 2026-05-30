@@ -438,9 +438,61 @@ function calc5mFlow(candles5m) {
   return { bullRatio, bearRatio: 1-bullRatio, volSurge, avgVol, rebound, breakdown };
 }
  
+// ── P4：三重確認突破偵測 ─────────────────────────────
+// 5m + 15m + 1H 三時框同時確認，才判定為有效突破
+function detectTripleBreakout(candles1h, candles5m, candles15m) {
+  const result = { bullBreak: false, bearBreak: false, strength: 0, desc: '' };
+  if (!candles1h.length || !candles5m.length || !candles15m.length) return result;
+ 
+  // ── 5m 確認：連續 3 根同向 + 成交量遞增 ──────────
+  const c5 = candles5m.slice(0, 5);
+  const vol5Avg = candles5m.slice(5, 15).reduce((s,c)=>s+c.vol,0) / 10 || 1;
+  const bull5 = c5.slice(0,3).every(c => c.close > c.open); // 連續3根陽線
+  const bear5 = c5.slice(0,3).every(c => c.close < c.open); // 連續3根陰線
+  const volSpike5 = c5[0].vol / vol5Avg; // 最新根量比
+ 
+  // ── 15m 確認：突破近15根最高/最低 + 爆量 ─────────
+  const c15 = candles15m;
+  const high15 = Math.max(...c15.slice(1, 16).map(c => c.high)); // 前15根最高點
+  const low15  = Math.min(...c15.slice(1, 16).map(c => c.low));  // 前15根最低點
+  const vol15Avg = c15.slice(1, 11).reduce((s,c)=>s+c.vol,0) / 10 || 1;
+  const volSpike15 = c15[0].vol / vol15Avg;
+  const bull15 = c15[0].close > high15 && volSpike15 > 2;  // 突破15根最高 + 爆量
+  const bear15 = c15[0].close < low15  && volSpike15 > 2;  // 跌破15根最低 + 爆量
+ 
+  // ── 1H 確認：MACD 方向 或 突破壓力/支撐 ─────────
+  const macd1h = (() => {
+    const c = candles1h.map(x => x.close).reverse();
+    const ema = (d, p) => { const k=2/(p+1); let e=d[0]; for(let i=1;i<d.length;i++) e=d[i]*k+e*(1-k); return e; };
+    const m = ema(c,12)-ema(c,26); return { histogram: m - ema(c.slice(-9),9) };
+  })();
+  const bull1h = macd1h.histogram > 0;
+  const bear1h = macd1h.histogram < 0;
+ 
+  // ── 三重確認結果 ──────────────────────────────────
+  const bullScore = (bull5?1:0) + (bull15?1:0) + (bull1h?1:0);
+  const bearScore = (bear5?1:0) + (bear15?1:0) + (bear1h?1:0);
+ 
+  if (bullScore >= 2 && bull15) {
+    // 至少 2/3 確認，且 15m 必須突破
+    result.bullBreak = true;
+    result.strength  = bullScore;
+    result.volSpike  = Math.max(volSpike5, volSpike15).toFixed(1);
+    result.desc = `三重確認急拉：5m${bull5?'✅':'⬜'} 15m${bull15?'✅':'⬜'} 1H${bull1h?'✅':'⬜'} 量${result.volSpike}x`;
+  }
+  if (bearScore >= 2 && bear15) {
+    result.bearBreak = true;
+    result.strength  = bearScore;
+    result.volSpike  = Math.max(volSpike5, volSpike15).toFixed(1);
+    result.desc = `三重確認急跌：5m${bear5?'✅':'⬜'} 15m${bear15?'✅':'⬜'} 1H${bear1h?'✅':'⬜'} 量${result.volSpike}x`;
+  }
+ 
+  return result;
+}
+ 
 // ── 做多評分 ───────────────────────────────────
 function scoreLong(reasons, score, p) {
-  const { last, resistance, support, rsi, macd, boll, ma10, ma20, ma50, flow5m, volRatio, isCandle_bull, bodyRatio, mtf, obvTrend, rsiDiv, isTrend, vwap, adx, signal15m, mom15m } = p;
+  const { last, resistance, support, rsi, macd, boll, ma10, ma20, ma50, flow5m, volRatio, isCandle_bull, bodyRatio, mtf, obvTrend, rsiDiv, isTrend, vwap, adx, signal15m, mom15m, tripleBreak } = p;
   if (last.close > resistance && volRatio > 1.2) {
     reasons.push({ t: `突破${fmt(resistance)}阻力`, ok: true }); score += 18;
   }
@@ -474,6 +526,11 @@ function scoreLong(reasons, score, p) {
   // ── 5m 強力反彈加分 ───────────────────────────────
   if (flow5m.rebound) {
     reasons.push({ t: '5m急跌爆量反彈🔥', ok: true }); score += 15;
+  }
+  // ── P4：三重確認突破加分 ─────────────────────────
+  if (tripleBreak?.bullBreak) {
+    const bonus = tripleBreak.strength >= 3 ? 25 : 15;
+    reasons.push({ t: `三重確認急拉🚀(${tripleBreak.strength}/3)`, ok: true }); score += bonus;
   }
  
   // ── T4：15m 動能確認加分 ─────────────────────────
@@ -539,7 +596,7 @@ function scoreLong(reasons, score, p) {
  
 // ── 做空評分 ───────────────────────────────────
 function scoreShort(reasons, score, p) {
-  const { last, support, rsi, macd, boll, ma10, ma20, ma50, flow5m, volRatio, isCandle_bull, bodyRatio, mtf, obvTrend, rsiDiv, isTrend, vwap, adx, signal15m, mom15m } = p;
+  const { last, support, rsi, macd, boll, ma10, ma20, ma50, flow5m, volRatio, isCandle_bull, bodyRatio, mtf, obvTrend, rsiDiv, isTrend, vwap, adx, signal15m, mom15m, tripleBreak } = p;
   if (last.close < support && volRatio > 1.2) {
     reasons.push({ t: `跌破${fmt(support)}支撐`, ok: true }); score += 18;
   }
@@ -570,6 +627,11 @@ function scoreShort(reasons, score, p) {
   // ── 5m 強力跌破加分 ───────────────────────────────
   if (flow5m.breakdown) {
     reasons.push({ t: '5m大漲爆量跌破🔥', ok: true }); score += 15;
+  }
+  // ── P4：三重確認跌破加分 ─────────────────────────
+  if (tripleBreak?.bearBreak) {
+    const bonus = tripleBreak.strength >= 3 ? 25 : 15;
+    reasons.push({ t: `三重確認急跌📉(${tripleBreak.strength}/3)`, ok: true }); score += bonus;
   }
  
   // ── T4：15m 動能確認加分 ─────────────────────────
@@ -673,6 +735,8 @@ async function analyze(instId) {
   const boll   = calcBollinger(candles);
   const vwap   = calcVWAP(candles); // W2: VWAP
   const flow5m   = calc5mFlow(candles5m);
+  // ── P4：三重確認突破偵測 ─────────────────────────
+  const tripleBreak = detectTripleBreakout(candles, candles5m, candles15m);
  
   // ── T4：15m 指標計算 ─────────────────────────────────
   let signal15m = 'neutral'; // 'bull' | 'bear' | 'neutral'
@@ -746,9 +810,9 @@ async function analyze(instId) {
   // 評分計算（呼叫獨立函式）
   // ══════════════════════════════════════════════
   if (dir === 'long') {
-    score = scoreLong(reasons, score, { last, resistance, support, rsi, macd, boll, ma10, ma20, ma50, flow5m, volRatio, isCandle_bull, bodyRatio, mtf, obvTrend, rsiDiv, isTrend, vwap, adx, signal15m, mom15m });
+    score = scoreLong(reasons, score, { last, resistance, support, rsi, macd, boll, ma10, ma20, ma50, flow5m, volRatio, isCandle_bull, bodyRatio, mtf, obvTrend, rsiDiv, isTrend, vwap, adx, signal15m, mom15m, tripleBreak });
   } else if (dir === 'short') {
-    score = scoreShort(reasons, score, { last, resistance, support, rsi, macd, boll, ma10, ma20, ma50, flow5m, volRatio, isCandle_bull, bodyRatio, mtf, obvTrend, rsiDiv, isTrend, vwap, adx, signal15m, mom15m });
+    score = scoreShort(reasons, score, { last, resistance, support, rsi, macd, boll, ma10, ma20, ma50, flow5m, volRatio, isCandle_bull, bodyRatio, mtf, obvTrend, rsiDiv, isTrend, vwap, adx, signal15m, mom15m, tripleBreak });
   } else {
     reasons.push({ t: `RSI中性(${rsi.toFixed(0)})`, ok: false });
     reasons.push({ t: 'MACD方向不明', ok: false });
@@ -828,7 +892,7 @@ async function analyze(instId) {
     slAmount, tp1Amount, tp2Amount, tp3Amount, fee,
     doubleCapital, flow5m, rsi, macd, swapSz,
     currentPrice: currentPrice || entry,
-    adx, isTrend, mtfDir: mtf.mtfDir, obvTrend, rsiDiv, flow5m, trend4h, atr: atr, vwap, signal15m,
+    adx, isTrend, mtfDir: mtf.mtfDir, obvTrend, rsiDiv, flow5m, trend4h, atr: atr, vwap, signal15m, tripleBreak,
     vwapPos: vwap > 0 ? (last.close > vwap * 1.003 ? '🔼VWAP上' : last.close < vwap * 0.997 ? '🔽VWAP下' : '↔️VWAP中') : '',
   };
 }
@@ -859,6 +923,8 @@ function buildTextSignal(pair, a, badge) {
       `🎯 TP3：\`${fmt(a.tp3||0)}\`（**+$${a.tp3Amount||0}**）\n` +
       `──────────────\n` +
       `✅ ${good}\n` +
+      (a.tripleBreak?.bullBreak || a.tripleBreak?.bearBreak
+        ? `🚀 ${a.tripleBreak.desc}\n` : '') +
       (bad ? `❌ ${bad}\n` : '') +
       (a.rsiDiv && a.rsiDiv !== 'none' ? `🔔 RSI ${a.rsiDiv==='bullish'?'底背離':'頂背離'} · ` : '') +
       (a.obvTrend === 'up' ? 'OBV↑ ' : a.obvTrend === 'down' ? 'OBV↓ ' : '') +
