@@ -121,9 +121,8 @@ const recentPushes = new Map(); // pair → { dir, entry, ts } 防重複推送
 const isDuplicatePush = (pair, a) => {
   const last = recentPushes.get(pair);
   if (!last) return false;
-  return last.dir === a.dir
-    && Math.abs(last.entry - a.entry) / a.entry < 0.002
-    && Date.now() - last.ts < 10 * 60 * 1000;
+  // 只看方向+時間，不看進場價（快速行情下進場價已移動）
+  return last.dir === a.dir && Date.now() - last.ts < 10 * 60 * 1000;
 };
 const markPushed = (pair, a) => recentPushes.set(pair, { dir: a.dir, entry: a.entry, ts: Date.now() });
  
@@ -695,7 +694,7 @@ async function analyze(instId) {
   const mtf = { mtfDir: 'neutral', mtfBonus: 0 }; // MTF 已移除
  
   const [candles, candles5m] = await Promise.all([
-    fetchCandles(instId, '1H', 50).catch(() => []),
+    fetchCandles(instId, '1H', 55).catch(() => []),  // 55根確保ma50計算完整
     fetchCandles5m(instId).catch(() => []),
   ]);
   const ticker = candles.length ? { last: String(candles[0].close) } : null;
@@ -910,28 +909,47 @@ function buildTextSignal(pair, a, badge) {
     const good = (a.reasons || []).filter(r => r.ok).map(r => r.t).join(' · ') || '—';
     const bad  = (a.reasons || []).filter(r => !r.ok).map(r => r.t).join(' · ');
     const price = a.currentPrice || a.entry || 0;
+    const slPct   = a.entry > 0 ? ((Math.abs(a.entry-a.sl)/a.entry)*100).toFixed(2) : '0';
+    const rrRatio  = a.slAmount > 0 ? (a.tp3Amount/a.slAmount).toFixed(1) : '—';
+    const t4h      = a.trend4h==='bull'?'📈多頭':a.trend4h==='bear'?'📉空頭':'➡️中性';
+    const tBtc     = btcTrend==='bull'?'📈多頭':btcTrend==='bear'?'📉空頭':'➡️中性';
+    const slArrow  = isLong ? '🔻' : '🔺';
     return (
-      `${badge} **${sym}** ${dir}  評分 **${a.score}**/100  ${(()=>{ const h=parseInt(new Date().toLocaleString('en-US',{timeZone:'Asia/Taipei',hour:'numeric',hour12:false})); return h>=21||h<5?'🇺🇸美國盤':h>=15?'🇪🇺歐洲盤':h>=8?'🌏亞洲盤':'🌙深夜'; })()}\n` +
-      `RSI **${(a.rsi||0).toFixed(0)}** · ADX **${(a.adx||0).toFixed(0)}** · ${a.isTrend?'📊 趨勢':'〰️ 震盪'} · ${a.vwapPos||''} · 15m${a.signal15m==='bull'?' 📈':a.signal15m==='bear'?' 📉':' ➡️'}\n` +
-      `──────────────\n` +
-      `💹 現價：\`${fmt(price)}\`\n` +
-      `🟢 進場：\`${fmt(a.entry||0)}\`  ⚡${a.leverage||1}x\n` +
-      `🔺 止損：\`${fmt(a.sl||0)}\`（最虧 **-$${a.slAmount||0}**）\n` +
-      `──────────────\n` +
-      `🎯 TP1：\`${fmt(a.tp1||0)}\`（**+$${a.tp1Amount||0}**）\n` +
-      `🎯 TP2：\`${fmt(a.tp2||0)}\`（**+$${a.tp2Amount||0}**）\n` +
-      `🎯 TP3：\`${fmt(a.tp3||0)}\`（**+$${a.tp3Amount||0}**）\n` +
-      `──────────────\n` +
-      `✅ ${good}\n` +
-      (a.tripleBreak?.bullBreak || a.tripleBreak?.bearBreak
-        ? `🚀 ${a.tripleBreak.desc}\n` : '') +
+      `${badge} **${sym}** ${dir}  評分 **${a.score}**/100  ${(()=>{ const h=parseInt(new Date().toLocaleString('en-US',{timeZone:'Asia/Taipei',hour:'numeric',hour12:false})); return h>=21||h<5?'🇺🇸美國盤':h>=15?'🇪🇺歐洲盤':h>=8?'🌏亞洲盤':'🌙深夜'; })()}
+` +
+      `RSI **${(a.rsi||0).toFixed(0)}** · ADX **${(a.adx||0).toFixed(0)}** · ${a.isTrend?'📊趨勢':'〰震盪'} · ${a.vwapPos||''} · 15m${a.signal15m==='bull'?' 📈':a.signal15m==='bear'?' 📉':' ➡️'}
+` +
+      `4H ${t4h} · BTC ${tBtc}
+` +
+      `──────────────
+` +
+      `💹 現價：\`${fmt(price)}\`
+` +
+      `🟢 進場：\`${fmt(a.entry||0)}\`  ⚡${a.leverage||1}x  盈虧比 **1:${rrRatio}**
+` +
+      `${slArrow} 止損：\`${fmt(a.sl||0)}\`（-${slPct}%，最虧 **-$${a.slAmount||0}**）
+` +
+      `──────────────
+` +
+      `🎯 TP1：\`${fmt(a.tp1||0)}\`（**+$${a.tp1Amount||0}**）
+` +
+      `🎯 TP2：\`${fmt(a.tp2||0)}\`（**+$${a.tp2Amount||0}**）
+` +
+      `🎯 TP3：\`${fmt(a.tp3||0)}\`（**+$${a.tp3Amount||0}**）
+` +
+      `──────────────
+` +
+      `✅ ${good}
+` +
+      (a.tripleBreak?.bullBreak || a.tripleBreak?.bearBreak ? `🚀 ${a.tripleBreak.desc}
+` : '') +
       (bad ? `❌ ${bad}\n` : '') +
-      (a.rsiDiv && a.rsiDiv !== 'none' ? `🔔 RSI ${a.rsiDiv==='bullish'?'底背離':'頂背離'} · ` : '') +
+      (a.rsiDiv && a.rsiDiv !== 'none' ? `🔔 RSI${a.rsiDiv==='bullish'?'底背離':'頂背離'} · ` : '') +
       (a.obvTrend === 'up' ? 'OBV↑ ' : a.obvTrend === 'down' ? 'OBV↓ ' : '') +
       ((a.rsiDiv && a.rsiDiv !== 'none') || a.obvTrend !== 'flat' ? '\n' : '') +
       `──────────────\n` +
       `💰 本金 **$${a.capital||100}** · 倉位 **$${a.positionSize||0}** · 手續費 $${a.fee||0}\n` +
-      `📌 訊號來源：Alice Bot`
+      `📌 Alice Bot`
     );
   } catch (err) {
     console.error('buildTextSignal 錯誤:', err.message);
@@ -960,7 +978,12 @@ async function _doScan() {
   const results = [];
   for (let i = 0; i < WATCH_PAIRS.length; i++) {
     const pair = WATCH_PAIRS[i];
-    const r = await analyze(pair).then(a => ({ pair, a })).catch(e => ({ status:'rejected', reason:e }));
+    let r = await analyze(pair).then(a => ({ pair, a })).catch(e => ({ status:'rejected', reason:e }));
+    if (r.status === 'rejected' || !r.a) {
+      // 重試一次（網路抖動）
+      await new Promise(x => setTimeout(x, 1000));
+      r = await analyze(pair).then(a => ({ pair, a })).catch(e => ({ status:'rejected', reason:e }));
+    }
     results.push({ status: 'fulfilled', value: r });
     // 每幣掃完後休息 600ms（4H axios + 2次API × 800ms + 緩衝）
     if (i < WATCH_PAIRS.length - 1) {
@@ -975,7 +998,10 @@ async function _doScan() {
     if (res.status === 'rejected') continue;
     const { pair, a } = res.value;
     if (!a || a.dir === 'neutral') continue;
-    if (a.score < MIN_SCORE) { if (a.score >= 50) recordSignal(pair, a.score, a.dir); continue; }
+    if (a.score < MIN_SCORE) {
+      if (a.score >= 60) dailyStats.potential = [...(dailyStats.potential||[]), { pair, score: a.score, dir: a.dir }];
+      continue;
+    }
     // #4 過濾：volSurge 依幣種分層（迷因幣放寬）
     const memePairs = ['DOGE-USDT','PEPE-USDT','WIF-USDT','BONK-USDT','SHIB-USDT','FLOKI-USDT'];
     const volSurgeMin = memePairs.includes(pair) ? 0.5 : 0.7;
@@ -1022,7 +1048,8 @@ async function _doScan() {
     if (atrPct < 0.003) { console.log(`🌙 ${pair} 波動率過低(${(atrPct*100).toFixed(2)}%)，盤整中跳過`); continue; }
     if (atrPct > 0.04)  { console.log(`⚡ ${pair} 波動率過高(${(atrPct*100).toFixed(2)}%)，極端行情跳過`); continue; }
  
-    if (isOnCooldown(pair)) continue;
+    // 強訊號（≥85）跳過冷卻限制
+    if (isOnCooldown(pair) && a.score < 85) continue;
     if (isDuplicatePush(pair, a)) { console.log(`⏭ 重複略過 ${pair}`); continue; }
     validSignals.push({ pair, a });
   }
@@ -1056,9 +1083,11 @@ async function _doScan() {
     const badge = isStrong ? '🔴 強訊號' : '🟡 中訊號';
     const msg = buildTextSignal(pair, a, badge);
     console.log(`📤 推送 ${pair} ${badge} 評分${a.score}（${msg.length}字）`);
-    const color = a.dir === 'long'
-      ? (isStrong ? 0x00E578 : 0x00A854)
-      : (isStrong ? 0xFF4466 : 0xCC2244);
+    const isTriple = a.tripleBreak?.bullBreak || a.tripleBreak?.bearBreak;
+    const color = isTriple ? 0xFF8C00  // 橙色=三重確認突破
+      : a.dir === 'long'
+        ? (isStrong ? 0x00E578 : 0x00A854)
+        : (isStrong ? 0xFF4466 : 0xCC2244);
     const ok = await discordPush(msg, true, color);
     if (ok) {
       markPushed(pair, a);
@@ -1147,11 +1176,48 @@ app.get('/health', (req, res) => res.json({
 cron.schedule('*/2 * * * *', scanAndPush); // 加快取後 ~74 秒/輪，2 分鐘有 46 秒緩衝
 cron.schedule('*/15 * * * *', () => updateBtcTrend().catch(()=>{})); // BTC趨勢每15分鐘
  
+// 每6小時清理過期快取（防止記憶體洩漏）
+cron.schedule('0 */6 * * *', () => {
+  const now = Date.now();
+  let cleared = 0;
+  for (const [k, v] of cache4h.entries())      { if (now - v.ts > TTL_4H  * 2) { cache4h.delete(k);      cleared++; } }
+  for (const [k, v] of cache15m.entries())     { if (now - v.ts > TTL_15M * 2) { cache15m.delete(k);     cleared++; } }
+  for (const [k, v] of fundRateCache.entries()){ if (now - v.ts > 15*60*1000*2){ fundRateCache.delete(k); cleared++; } }
+  if (cleared > 0) console.log(`🧹 清理過期快取 ${cleared} 項`);
+});
+ 
 // 每天 00:00 重置每日統計與熔斷
+// 每天 20:00 推送今日績效摘要
+cron.schedule('0 20 * * *', async () => {
+  try {
+    const sigs = dailyStats.signals;
+    if (!sigs.length) return;
+    const strong = sigs.filter(s => s.score >= 80).length;
+    const mid    = sigs.filter(s => s.score >= 70 && s.score < 80).length;
+    const longs  = sigs.filter(s => s.dir === 'long').length;
+    const shorts = sigs.filter(s => s.dir === 'short').length;
+    const avgScore = Math.round(sigs.reduce((s,x) => s+x.score, 0) / sigs.length);
+    const topPairs = Object.entries(sigs.reduce((acc, s) => {
+      acc[s.pair] = (acc[s.pair]||0)+1; return acc;
+    }, {})).sort((a,b)=>b[1]-a[1]).slice(0,3).map(([p,n])=>`${p.replace('-USDT','')}(${n})`).join(' ');
+    const summary =
+      `📊 **今日訊號摘要** ${dailyStats.date}\n` +
+      `──────────────\n` +
+      `總訊號：**${sigs.length}** 個（🔴強${strong} 🟡中${mid}）\n` +
+      `做多：${longs} · 做空：${shorts}\n` +
+      `平均評分：**${avgScore}**/100\n` +
+      `最多幣種：${topPairs}\n` +
+      `今日虧損：$${dailyStats.dailyLoss.toFixed(2)}/$${DAILY_MAX_LOSS}`;
+    await discordPush(summary, false);
+    console.log('📊 每日摘要已推送');
+  } catch(e) { console.error('摘要推送失敗:', e.message); }
+}, { timezone: 'Asia/Taipei' });
+ 
 cron.schedule('0 0 * * *', () => {
   dailyStats.dailyLoss = 0;
   dailyStats.isFused   = false;
   dailyStats.signals   = [];
+  dailyStats.potential = [];
   dailyStats.date      = new Date().toLocaleDateString('zh-TW', { timeZone: 'Asia/Taipei' });
   recentPushes.clear();   // 清除跨日去重快取
   signalCooldown.clear();  // 清除冷卻
