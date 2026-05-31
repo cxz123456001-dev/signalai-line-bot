@@ -162,6 +162,62 @@ function addDailyLoss(amount) {
 // ── BTC 市場情緒緩存 ─────────────────────────────────
 let btcTrend = 'neutral'; // 'bull' | 'bear' | 'neutral'
 let btcTrendUpdatedAt = 0;
+// ══════════════════════════════════════════════
+// S1：川普 Truth Social 監控
+// ══════════════════════════════════════════════
+let trumpCache = { lastPost: '', lastTs: 0 };
+const TRUMP_BULL_KW = ['crypto','bitcoin','btc','blockchain','stablecoin','strategic reserve','buy','genius act','clarity act','freedom'];
+const TRUMP_BEAR_KW = ['tariff','sanction','ban','restrict','investigate','fraud','manipulate','china','iran war','blockade'];
+const TRUMP_GEO_KW  = ['iran','strait','hormuz','war','blockade','nuclear','military','attack'];
+ 
+async function checkTrumpPosts() {
+  const APIFY_KEY = process.env.APIFY_API_KEY || '';
+  if (!APIFY_KEY) return; // 未設定就跳過
+  try {
+    // Apify Truth Social Scraper
+    const url = `https://api.apify.com/v2/acts/muhammetakkurtt~truth-social-scraper/run-sync-get-dataset-items?token=${APIFY_KEY}&username=realDonaldTrump&maxItems=1`;
+    const { data } = await axios.get(url, { timeout: 20000 });
+    if (!data?.length) return;
+    const post = data[0];
+    const text = (post.content || post.text || '').toLowerCase();
+    const ts   = post.createdAt || post.created_at || '';
+    // 避免重複推送同一篇
+    if (ts === trumpCache.lastTs || !text) return;
+    trumpCache = { lastPost: text, lastTs: ts };
+ 
+    // 判斷關鍵字類型
+    const hasBull = TRUMP_BULL_KW.some(k => text.includes(k));
+    const hasBear = TRUMP_BEAR_KW.some(k => text.includes(k));
+    const hasGeo  = TRUMP_GEO_KW.some(k => text.includes(k));
+ 
+    if (!hasBull && !hasBear && !hasGeo) return; // 無關貼文跳過
+ 
+    const preview = (post.content || post.text || '').slice(0, 120);
+    let msg = `🇺🇸 **川普 Truth Social 新貼文**
+`;
+    msg += `─────────────────
+`;
+    msg += `"${preview}..."
+`;
+    msg += `─────────────────
+`;
+    if (hasGeo)       msg += `🌍 地緣政治消息 → 建議暫停開倉
+`;
+    else if (hasBull) msg += `🟢 正面加密消息 → 做多情緒提升
+`;
+    else if (hasBear) msg += `🔴 負面消息 → 注意風險
+`;
+    msg += `⏰ ${new Date(ts).toLocaleString('zh-TW', { timeZone: 'Asia/Taipei' })}`;
+ 
+    await discordPush(msg, false, hasGeo ? 0xFF8C00 : hasBull ? 0x00E578 : 0xFF4466);
+    console.log(`🇺🇸 川普新貼文偵測：${hasBull?'正面':hasBear?'負面':'地緣政治'}`);
+ 
+    // 暫存情緒供評分使用
+    trumpCache.sentiment = hasBull ? 'bull' : hasBear ? 'bear' : 'geo';
+    trumpCache.sentimentTs = Date.now();
+  } catch(e) { console.warn('川普監控失敗:', e.message); }
+}
+ 
 // ── I4：VIX 恐慌指數快取 ─────────────────────────────
 let vixCache = { value: 15, ts: 0 };
 async function updateVIX() {
@@ -1187,6 +1243,31 @@ async function _doScan() {
     const atr = a.atr || 0;
     const slDist = Math.abs(a.entry - a.sl);
     const candleRange = a.entry * 0.02; // 近似
+    // S4：加密新聞情緒加成（30分鐘內有效）
+    const pairNews = newsCache.pairSentiment?.[pair];
+    if (pairNews && Date.now() - pairNews.ts < 30 * 60 * 1000) {
+      if (pairNews.bull && a.dir === 'long')   a.score = Math.min(100, a.score + 8);
+      if (!pairNews.bull && a.dir === 'short') a.score = Math.min(100, a.score + 8);
+    }
+ 
+    // S2：經濟日曆過濾
+    const ecoEvent = isNearEconomicEvent();
+    if (ecoEvent) {
+      if (ecoEvent.before && ecoEvent.ev.impact === 'high') {
+        console.log(`📅 ${pair} 重大數據前${ecoEvent.diff}分（${ecoEvent.ev.name}），跳過`); continue;
+      }
+      if (!ecoEvent.before && ecoEvent.ev.impact === 'high' && a.score < MIN_SCORE + 5) {
+        console.log(`📅 ${pair} 數據剛發布${-ecoEvent.diff}分，等待確認，跳過`); continue;
+      }
+    }
+ 
+    // S1：川普情緒加成（30分鐘內有效）
+    if (trumpCache.sentimentTs && Date.now() - trumpCache.sentimentTs < 30 * 60 * 1000) {
+      if (trumpCache.sentiment === 'bull' && a.dir === 'long')  a.score = Math.min(100, a.score + 10);
+      if (trumpCache.sentiment === 'bear' && a.dir === 'short') a.score = Math.min(100, a.score + 10);
+      if (trumpCache.sentiment === 'geo') { console.log(`🌍 ${pair} 地緣政治警戒，跳過`); continue; }
+    }
+ 
     // I4：VIX 市場恐慌過濾
     const vix = vixCache.value;
     if (vix > 35 && a.dir === 'long') { console.log(`🚨 ${pair} VIX=${vix.toFixed(1)}極度恐慌，否決做多`); continue; }
@@ -1278,6 +1359,8 @@ async function _doScan() {
       markPushed(pair, a);
       setCooldown(pair);
       recordSignal(pair, a.score, a.dir);
+      // S3：加入追蹤清單
+      trackedSignals.set(pair, { entry:a.entry, sl:a.sl, tp1:a.tp1, tp2:a.tp2, tp3:a.tp3, dir:a.dir, ts:Date.now() });
       console.log(`✅ 推送完成：${pair} [連虧:${dailyStats.consecutiveLoss||0}]`);
     }
     // #3 效能：最後一個訊號不等待
@@ -1356,10 +1439,155 @@ app.get('/health', (req, res) => res.json({
 }));
  
 // ══════════════════════════════════════════════
+// S2：經濟日曆（高影響力事件過濾）
+// ══════════════════════════════════════════════
+// 固定重大事件時間（台北時間，每月更新）
+// CPI 通常每月第2-3週，非農第1個週五，Fed 每6週
+const ECONOMIC_EVENTS = [
+  // 格式：{ name, hour, minute, dayOfWeek(-1=any), impact }
+  // 每月固定時間（只設常見時段）
+  { name: '美國 CPI',       hour: 21, minute: 30, dayOfWeek: -1, impact: 'high' },
+  { name: '美國非農就業',    hour: 21, minute: 30, dayOfWeek:  5, impact: 'high' }, // 週五
+  { name: 'Fed 利率決議',   hour: 2,  minute: 0,  dayOfWeek: -1, impact: 'high' },
+  { name: '美國 PCE',       hour: 21, minute: 30, dayOfWeek: -1, impact: 'medium' },
+  { name: '美國 GDP',       hour: 21, minute: 30, dayOfWeek: -1, impact: 'medium' },
+  { name: '美國零售銷售',    hour: 21, minute: 30, dayOfWeek: -1, impact: 'medium' },
+];
+ 
+function isNearEconomicEvent() {
+  const now = new Date();
+  const tpe = new Date(now.toLocaleString('en-US', { timeZone: 'Asia/Taipei' }));
+  const h = tpe.getHours(), m = tpe.getMinutes(), dow = tpe.getDay();
+  const totalMin = h * 60 + m;
+ 
+  for (const ev of ECONOMIC_EVENTS) {
+    if (ev.dayOfWeek !== -1 && ev.dayOfWeek !== dow) continue;
+    const evMin = ev.hour * 60 + ev.minute;
+    const diff  = evMin - totalMin; // 正數=未發布，負數=已發布
+    if (diff > 0 && diff <= 30) return { before: true,  ev, diff }; // 發布前30分
+    if (diff < 0 && diff >= -15) return { before: false, ev, diff }; // 發布後15分
+  }
+  return null;
+}
+ 
+async function sendDailyEconomicCalendar() {
+  // 每天早上9點推送今日重要事件
+  const today = new Date().toLocaleDateString('zh-TW', { timeZone:'Asia/Taipei', weekday:'short' });
+  const events = ECONOMIC_EVENTS.filter(e => {
+    const dow = new Date().toLocaleString('en-US', { timeZone:'Asia/Taipei', weekday:'long' });
+    return e.dayOfWeek === -1 || e.dayOfWeek === ['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'].indexOf(dow);
+  });
+  if (!events.length) return;
+  const list = events.map(e => `• ${e.name} ${e.hour}:${String(e.minute).padStart(2,'0')} ${e.impact==='high'?'🔴':'🟡'}`).join('\n');
+  await discordPush(`📅 **今日重要經濟數據** (${today})\n─────────────────\n${list}\n─────────────────\n🔴=高影響 · 建議發布前後30分謹慎開倉`, false).catch(()=>{});
+}
+ 
+// ══════════════════════════════════════════════
+// S3：動態止盈追蹤（追蹤訊號後推送止損調整建議）
+// ══════════════════════════════════════════════
+const trackedSignals = new Map(); // pair → { entry, sl, tp1, tp2, tp3, dir, ts }
+ 
+async function checkTrackedSignals() {
+  if (!trackedSignals.size) return;
+  const now = Date.now();
+  for (const [pair, sig] of trackedSignals.entries()) {
+    // 超過4小時的訊號自動移除
+    if (now - sig.ts > 4 * 60 * 60 * 1000) { trackedSignals.delete(pair); continue; }
+    try {
+      // 取最新價格
+      const candles = await fetchCached15m(pair).catch(() => []);
+      if (!candles.length) continue;
+      const price = candles[0].close;
+      const sym = pair.replace('-USDT','');
+ 
+      // 檢查是否達到 TP1（推送止損移動建議）
+      if (sig.dir === 'long' && price >= sig.tp1 && !sig.tp1Hit) {
+        sig.tp1Hit = true;
+        await discordPush(
+          `🎯 **${sym} 做多 TP1 達到！**
+現價：\`${price}\`
+💡 建議：止損移至進場價 \`${sig.entry}\`（保本）
+剩餘目標：TP2 \`${sig.tp2}\` / TP3 \`${sig.tp3}\``,
+          false, 0x00E578
+        );
+      } else if (sig.dir === 'short' && price <= sig.tp1 && !sig.tp1Hit) {
+        sig.tp1Hit = true;
+        await discordPush(
+          `🎯 **${sym} 做空 TP1 達到！**
+現價：\`${price}\`
+💡 建議：止損移至進場價 \`${sig.entry}\`（保本）
+剩餘目標：TP2 \`${sig.tp2}\` / TP3 \`${sig.tp3}\``,
+          false, 0x00E578
+        );
+      }
+      // TP2 達到
+      if (sig.tp1Hit) {
+        if (sig.dir === 'long'  && price >= sig.tp2 && !sig.tp2Hit) {
+          sig.tp2Hit = true;
+          await discordPush(`🎯 **${sym} 做多 TP2 達到！** 現價 \`${price}\`
+💡 建議：止損移至 TP1 \`${sig.tp1}\`（鎖定部分利潤）`, false, 0x00E578);
+        }
+        if (sig.dir === 'short' && price <= sig.tp2 && !sig.tp2Hit) {
+          sig.tp2Hit = true;
+          await discordPush(`🎯 **${sym} 做空 TP2 達到！** 現價 \`${price}\`
+💡 建議：止損移至 TP1 \`${sig.tp1}\`（鎖定部分利潤）`, false, 0x00E578);
+        }
+      }
+    } catch(e) {}
+  }
+}
+// ══════════════════════════════════════════════
+// S4：加密新聞即時偵測（cryptocurrency.cv 免費）
+// ══════════════════════════════════════════════
+let newsCache = { lastId: '', ts: 0 };
+const NEWS_BULL_KW = ['etf approved','institutional','buy','bullish','adopt','reserve','partnership','launch','upgrade'];
+const NEWS_BEAR_KW = ['hack','exploit','scam','ban','sec','lawsuit','crash','bankruptcy','fraud','shutdown'];
+const NEWS_COIN_MAP = { 'bitcoin':'BTC-USDT','ethereum':'ETH-USDT','solana':'SOL-USDT','bnb':'BNB-USDT','xrp':'XRP-USDT' };
+ 
+async function checkCryptoNews() {
+  try {
+    const { data } = await axios.get('https://cryptocurrency.cv/api/v2/news?limit=5&language=en', { timeout: 10000 });
+    const articles = data?.articles || data?.data || [];
+    if (!articles.length) return;
+    const latest = articles[0];
+    const newsId = latest.id || latest.url || latest.title;
+    if (newsId === newsCache.lastId) return; // 沒有新消息
+    newsCache = { lastId: newsId, ts: Date.now() };
+ 
+    const title = (latest.title || '').toLowerCase();
+    const hasBull = NEWS_BULL_KW.some(k => title.includes(k));
+    const hasBear = NEWS_BEAR_KW.some(k => title.includes(k));
+    if (!hasBull && !hasBear) return;
+ 
+    // 找相關幣種
+    const relatedPair = Object.entries(NEWS_COIN_MAP).find(([k]) => title.includes(k))?.[1] || '';
+ 
+    const msg = `📰 **加密新聞快訊**
+─────────────────
+${latest.title}
+─────────────────
+${hasBull ? '🟢 正面消息' : '🔴 負面消息'}${relatedPair ? ` · 相關：${relatedPair.replace('-USDT','')}` : ''}
+來源：${latest.source || latest.sourceName || 'CryptoCurrency.cv'}`;
+    await discordPush(msg, false, hasBull ? 0x00A854 : 0xCC2244);
+ 
+    // 暫存消息情緒（30分鐘有效）
+    if (relatedPair) {
+      newsCache.pairSentiment = newsCache.pairSentiment || {};
+      newsCache.pairSentiment[relatedPair] = { bull: hasBull, ts: Date.now() };
+    }
+    console.log(`📰 新聞偵測：${hasBull?'正面':'負面'} - ${latest.title?.slice(0,50)}`);
+  } catch(e) { console.warn('加密新聞檢查失敗:', e.message); }
+}
+ 
+// ══════════════════════════════════════════════
 // 定時任務
 // ══════════════════════════════════════════════
 cron.schedule('*/2 * * * *', scanAndPush); // 加快取後 ~74 秒/輪，2 分鐘有 46 秒緩衝
+cron.schedule('0 9 * * *', () => sendDailyEconomicCalendar().catch(()=>{}), { timezone: 'Asia/Taipei' }); // S2：每日日曆
 cron.schedule('*/15 * * * *', () => { updateBtcTrend().catch(()=>{}); updateVIX().catch(()=>{}); }); // BTC趨勢+VIX每15分鐘
+cron.schedule('*/10 * * * *', () => checkTrumpPosts().catch(()=>{})); // S1：川普監控每10分鐘
+cron.schedule('*/5 * * * *',  () => checkTrackedSignals().catch(()=>{})); // S3：止盈追蹤每5分鐘
+cron.schedule('*/10 * * * *', () => checkCryptoNews().catch(()=>{}));     // S4：加密新聞每10分鐘
  
 // 每6小時清理過期快取（防止記憶體洩漏）
 cron.schedule('0 */6 * * *', () => {
@@ -1444,7 +1672,7 @@ app.listen(PORT, async () => {
  
   // 分散啟動：每個步驟間隔 5 秒，避免瞬間爆量
   setTimeout(async () => {
-    try { await updateBtcTrend(); await updateVIX(); } catch(e) {}
+    try { await updateBtcTrend(); await updateVIX(); await checkCryptoNews(); } catch(e) {}
   }, 2000);
  
   setTimeout(() => console.log(`📊 監控：${WATCH_PAIRS.map(p=>p.replace('-USDT','')).join(' ')}`), 8000);
