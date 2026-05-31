@@ -62,6 +62,15 @@ const linePush = (text) => discordPush(text, true);
 const USER_ID         = process.env.LINE_USER_ID;
 const DISCORD_WEBHOOK = process.env.DISCORD_WEBHOOK_URL || '';
 const MIN_SCORE       = parseInt(process.env.MIN_SCORE     || '70'); // 70分以上才推送，減少雜訊
+ 
+// F3：連續虧損動態門檻
+function getConsecutiveBonus() {
+  const n = dailyStats.consecutiveLoss || 0;
+  if (n >= 5) return 20; // 暫停1小時等級
+  if (n >= 3) return 10;
+  if (n >= 2) return 5;
+  return 0;
+}
 const MAX_LOSS_USDT   = parseFloat(process.env.MAX_LOSS_USDT  || '20');
 const BASE_CAPITAL    = parseFloat(process.env.BASE_CAPITAL   || '100');
 const MAX_LOSS_PCT    = parseFloat(process.env.MAX_LOSS_PCT   || '0.05');
@@ -153,6 +162,25 @@ function addDailyLoss(amount) {
 // ── BTC 市場情緒緩存 ─────────────────────────────────
 let btcTrend = 'neutral'; // 'bull' | 'bear' | 'neutral'
 let btcTrendUpdatedAt = 0;
+// ── I4：VIX 恐慌指數快取 ─────────────────────────────
+let vixCache = { value: 15, ts: 0 };
+async function updateVIX() {
+  const FINNHUB_KEY = process.env.FINNHUB_API_KEY || '';
+  if (!FINNHUB_KEY) return;
+  try {
+    const { data } = await axios.get('https://finnhub.io/api/v1/quote', {
+      params: { symbol: 'VIX', token: FINNHUB_KEY }, timeout: 8000
+    });
+    if (data?.c > 0) {
+      vixCache = { value: data.c, ts: Date.now() };
+      console.log(`📊 VIX 更新：${data.c.toFixed(1)}`);
+      if (data.c > 35) {
+        await discordPush(`🚨 **VIX 警報：${data.c.toFixed(1)}**\n極度恐慌！建議暫停做多，等待市場穩定`, false);
+      }
+    }
+  } catch(e) { console.warn('VIX 更新失敗:', e.message); }
+}
+ 
 async function updateBtcTrend() {
   try {
     // 直接呼叫 axios，不走 rateLimiter，避免佔用掃描配額
@@ -387,6 +415,99 @@ function calcBollinger(candles, period = 20) {
   return { upper: avg + 2 * std, middle: avg, lower: avg - 2 * std };
 }
  
+// ── I1：Stochastic RSI ────────────────────────────────
+function calcStochRSI(candles, rsiPeriod=14, stochPeriod=14) {
+  if (candles.length < rsiPeriod + stochPeriod) return 0.5;
+  // 計算一串 RSI 值
+  const rsiArr = [];
+  for (let s = 0; s <= stochPeriod; s++) {
+    const slice = candles.slice(s, s + rsiPeriod + 1);
+    let gains=0, losses=0;
+    for (let i=0; i<slice.length-1; i++) {
+      const d = slice[i].close - slice[i+1].close;
+      if (d > 0) gains += d; else losses -= d;
+    }
+    const avgG = gains/rsiPeriod, avgL = losses/rsiPeriod;
+    rsiArr.push(avgL === 0 ? 100 : 100 - 100/(1+avgG/avgL));
+  }
+  const maxRsi = Math.max(...rsiArr), minRsi = Math.min(...rsiArr);
+  return maxRsi === minRsi ? 0.5 : (rsiArr[0] - minRsi) / (maxRsi - minRsi);
+}
+ 
+// ── I2：EMA 排列順序 ───────────────────────────────────
+function calcEMAOrder(candles) {
+  const ema = (period) => {
+    const k=2/(period+1); let e=candles[candles.length-1].close;
+    for (let i=candles.length-2; i>=0; i--) e=candles[i].close*k+e*(1-k);
+    return e;
+  };
+  if (candles.length < 55) return 'neutral';
+  const e5=ema(5), e10=ema(10), e20=ema(20), e50=ema(50);
+  if (e5>e10 && e10>e20 && e20>e50) return 'bull'; // 完美多頭排列
+  if (e5<e10 && e10<e20 && e20<e50) return 'bear'; // 完美空頭排列
+  return 'neutral';
+}
+ 
+// ── I3：K線形態識別 ────────────────────────────────────
+function detectCandlePattern(candles) {
+  const c0=candles[0], c1=candles[1], c2=candles[2];
+  const atr = candles.slice(0,14).reduce((s,c,i,a)=>
+    i===0?s:s+Math.max(c.high-c.low,Math.abs(c.close-a[i-1].close)),0)/13||1;
+  const body0   = Math.abs(c0.close-c0.open);
+  const upper0  = c0.high - Math.max(c0.open,c0.close);
+  const lower0  = Math.min(c0.open,c0.close) - c0.low;
+  const isBull0 = c0.close > c0.open;
+  const isBull1 = c1.close > c1.open;
+  const body1   = Math.abs(c1.close-c1.open);
+ 
+  const patterns = { bull:0, bear:0, neutral:false, name:'' };
+ 
+  // 錘子線（做多）：下影線 > 實體2倍，上影線短，實體在上方
+  if (!isBull0 || isBull0) { // 錘子可以是陽或陰
+    if (lower0 > body0*2 && upper0 < body0*0.5 && body0 > atr*0.1) {
+      patterns.bull += 12; patterns.name = '錘子線';
+    }
+  }
+  // 流星線（做空）：上影線 > 實體2倍，下影線短
+  if (upper0 > body0*2 && lower0 < body0*0.5 && body0 > atr*0.1) {
+    patterns.bear += 12; patterns.name = '流星線';
+  }
+  // 多頭吞噬（做多）：前根陰 + 當根陽且完全覆蓋
+  if (isBull0 && !isBull1 && c0.close > c1.open && c0.open < c1.close) {
+    patterns.bull += 15; patterns.name = '多頭吞噬';
+  }
+  // 空頭吞噬（做空）：前根陽 + 當根陰且完全覆蓋
+  if (!isBull0 && isBull1 && c0.close < c1.open && c0.open > c1.close) {
+    patterns.bear += 15; patterns.name = '空頭吞噬';
+  }
+  // 十字星（中性）：實體極小
+  if (body0 < atr*0.1) {
+    patterns.neutral = true; patterns.name = '十字星';
+  }
+ 
+  return patterns;
+}
+ 
+// ── F1：市場結構 HH/HL/LL/LH ──────────────────────────
+function detectMarketStructure(candles) {
+  if (candles.length < 10) return 'neutral';
+  // 找最近3個擺動高低點
+  const highs = [], lows = [];
+  for (let i=1; i<Math.min(15,candles.length-1); i++) {
+    if (candles[i].high > candles[i-1].high && candles[i].high > candles[i+1]?.high) highs.push(candles[i].high);
+    if (candles[i].low  < candles[i-1].low  && candles[i].low  < candles[i+1]?.low)  lows.push(candles[i].low);
+  }
+  if (highs.length >= 2 && lows.length >= 2) {
+    const hh = highs[0] > highs[1]; // 最新高點 > 前高點 = Higher High
+    const hl = lows[0]  > lows[1];  // 最新低點 > 前低點 = Higher Low
+    const ll = lows[0]  < lows[1];  // Lower Low
+    const lh = highs[0] < highs[1]; // Lower High
+    if (hh && hl) return 'bull'; // HH + HL = 上升結構
+    if (ll && lh) return 'bear'; // LL + LH = 下降結構
+  }
+  return 'neutral';
+}
+ 
 // ── W2：VWAP 計算（成交量加權平均價）──────────────────
 // 機構最常用的參考線，判斷多空力道
 function calcVWAP(candles, period = 20) {
@@ -491,7 +612,7 @@ function detectTripleBreakout(candles1h, candles5m, candles15m) {
  
 // ── 做多評分 ───────────────────────────────────
 function scoreLong(reasons, score, p) {
-  const { last, resistance, support, rsi, macd, boll, ma10, ma20, ma50, flow5m, volRatio, isCandle_bull, bodyRatio, mtf, obvTrend, rsiDiv, isTrend, vwap, adx, signal15m, mom15m, tripleBreak } = p;
+  const { last, resistance, support, rsi, macd, boll, ma10, ma20, ma50, flow5m, volRatio, isCandle_bull, bodyRatio, mtf, obvTrend, rsiDiv, isTrend, vwap, adx, signal15m, mom15m, tripleBreak, stochRsi, emaOrder, candlePat, mktStruct } = p;
   if (last.close > resistance && volRatio > 1.2) {
     reasons.push({ t: `突破${fmt(resistance)}阻力`, ok: true }); score += 18;
   }
@@ -526,6 +647,28 @@ function scoreLong(reasons, score, p) {
   if (flow5m.rebound) {
     reasons.push({ t: '5m急跌爆量反彈🔥', ok: true }); score += 15;
   }
+ 
+  // ── I1：Stochastic RSI ────────────────────────────
+  if (stochRsi !== undefined) {
+    if (stochRsi < 0.2)      { reasons.push({ t: `StochRSI超賣(${stochRsi.toFixed(2)})`, ok: true  }); score += 10; }
+    else if (stochRsi > 0.8) { reasons.push({ t: `StochRSI過熱(${stochRsi.toFixed(2)})`, ok: false }); score -= 10; }
+  }
+ 
+  // ── I2：EMA 排列順序 ──────────────────────────────
+  if (emaOrder === 'bull')    { reasons.push({ t: 'EMA完美多頭排列✨', ok: true  }); score += 12; }
+  else if (emaOrder === 'bear') { reasons.push({ t: 'EMA空頭排列',      ok: false }); score -=  8; }
+ 
+  // ── I3：K線形態 ───────────────────────────────────
+  if (candlePat.bull > 0)    { reasons.push({ t: `${candlePat.name}📈`, ok: true  }); score += candlePat.bull; }
+  if (candlePat.neutral)     { reasons.push({ t: `${candlePat.name}猶豫`, ok: false }); score -= 8; }
+ 
+  // ── F1：市場結構 HH/HL ────────────────────────────
+  if (mktStruct === 'bull')  { reasons.push({ t: 'HH+HL上升結構✅', ok: true  }); score += 15; }
+  else if (mktStruct === 'bear') { reasons.push({ t: 'LL+LH下降結構', ok: false }); score -= 10; }
+ 
+  // ── F4：過熱反轉（做多但指標過熱 → 扣分）────────
+  if (rsi > 80 && adx > 50)  { reasons.push({ t: `過熱反轉風險(RSI${rsi.toFixed(0)})`, ok: false }); score -= 15; }
+ 
   // ── P4：三重確認突破加分 ─────────────────────────
   if (tripleBreak?.bullBreak) {
     const bonus = tripleBreak.strength >= 3 ? 25 : 15;
@@ -595,7 +738,7 @@ function scoreLong(reasons, score, p) {
  
 // ── 做空評分 ───────────────────────────────────
 function scoreShort(reasons, score, p) {
-  const { last, support, rsi, macd, boll, ma10, ma20, ma50, flow5m, volRatio, isCandle_bull, bodyRatio, mtf, obvTrend, rsiDiv, isTrend, vwap, adx, signal15m, mom15m, tripleBreak } = p;
+  const { last, support, rsi, macd, boll, ma10, ma20, ma50, flow5m, volRatio, isCandle_bull, bodyRatio, mtf, obvTrend, rsiDiv, isTrend, vwap, adx, signal15m, mom15m, tripleBreak, stochRsi, emaOrder, candlePat, mktStruct } = p;
   if (last.close < support && volRatio > 1.2) {
     reasons.push({ t: `跌破${fmt(support)}支撐`, ok: true }); score += 18;
   }
@@ -627,6 +770,28 @@ function scoreShort(reasons, score, p) {
   if (flow5m.breakdown) {
     reasons.push({ t: '5m大漲爆量跌破🔥', ok: true }); score += 15;
   }
+ 
+  // ── I1：Stochastic RSI ────────────────────────────
+  if (stochRsi !== undefined) {
+    if (stochRsi > 0.8)      { reasons.push({ t: `StochRSI過熱(${stochRsi.toFixed(2)})`, ok: true  }); score += 10; }
+    else if (stochRsi < 0.2) { reasons.push({ t: `StochRSI超賣(${stochRsi.toFixed(2)})`, ok: false }); score -= 10; }
+  }
+ 
+  // ── I2：EMA 排列順序 ──────────────────────────────
+  if (emaOrder === 'bear')    { reasons.push({ t: 'EMA完美空頭排列✨', ok: true  }); score += 12; }
+  else if (emaOrder === 'bull') { reasons.push({ t: 'EMA多頭排列',      ok: false }); score -=  8; }
+ 
+  // ── I3：K線形態 ───────────────────────────────────
+  if (candlePat.bear > 0)    { reasons.push({ t: `${candlePat.name}📉`, ok: true  }); score += candlePat.bear; }
+  if (candlePat.neutral)     { reasons.push({ t: `${candlePat.name}猶豫`, ok: false }); score -= 8; }
+ 
+  // ── F1：市場結構 LL/LH ────────────────────────────
+  if (mktStruct === 'bear')  { reasons.push({ t: 'LL+LH下降結構✅', ok: true  }); score += 15; }
+  else if (mktStruct === 'bull') { reasons.push({ t: 'HH+HL上升結構', ok: false }); score -= 10; }
+ 
+  // ── F4：過賣反轉（做空但指標過賣 → 扣分）────────
+  if (rsi < 20 && adx > 50)  { reasons.push({ t: `過賣反轉風險(RSI${rsi.toFixed(0)})`, ok: false }); score -= 15; }
+ 
   // ── P4：三重確認跌破加分 ─────────────────────────
   if (tripleBreak?.bearBreak) {
     const bonus = tripleBreak.strength >= 3 ? 25 : 15;
@@ -732,7 +897,11 @@ async function analyze(instId) {
   const macd   = calcMACD(candles);
   const atr    = calcATR(candles);
   const boll   = calcBollinger(candles);
-  const vwap   = calcVWAP(candles); // W2: VWAP
+  const vwap       = calcVWAP(candles);      // W2: VWAP
+  const stochRsi   = calcStochRSI(candles);  // I1: Stoch RSI
+  const emaOrder   = calcEMAOrder(candles);  // I2: EMA排列
+  const candlePat  = detectCandlePattern(candles); // I3: K線形態
+  const mktStruct  = detectMarketStructure(candles); // F1: 市場結構
   const flow5m   = calc5mFlow(candles5m);
   // ── P4：三重確認突破偵測 ─────────────────────────
   const tripleBreak = detectTripleBreakout(candles, candles5m, candles15m);
@@ -809,9 +978,9 @@ async function analyze(instId) {
   // 評分計算（呼叫獨立函式）
   // ══════════════════════════════════════════════
   if (dir === 'long') {
-    score = scoreLong(reasons, score, { last, resistance, support, rsi, macd, boll, ma10, ma20, ma50, flow5m, volRatio, isCandle_bull, bodyRatio, mtf, obvTrend, rsiDiv, isTrend, vwap, adx, signal15m, mom15m, tripleBreak });
+    score = scoreLong(reasons, score, { last, resistance, support, rsi, macd, boll, ma10, ma20, ma50, flow5m, volRatio, isCandle_bull, bodyRatio, mtf, obvTrend, rsiDiv, isTrend, vwap, adx, signal15m, mom15m, tripleBreak, stochRsi, emaOrder, candlePat, mktStruct });
   } else if (dir === 'short') {
-    score = scoreShort(reasons, score, { last, resistance, support, rsi, macd, boll, ma10, ma20, ma50, flow5m, volRatio, isCandle_bull, bodyRatio, mtf, obvTrend, rsiDiv, isTrend, vwap, adx, signal15m, mom15m, tripleBreak });
+    score = scoreShort(reasons, score, { last, resistance, support, rsi, macd, boll, ma10, ma20, ma50, flow5m, volRatio, isCandle_bull, bodyRatio, mtf, obvTrend, rsiDiv, isTrend, vwap, adx, signal15m, mom15m, tripleBreak, stochRsi, emaOrder, candlePat, mktStruct });
   } else {
     reasons.push({ t: `RSI中性(${rsi.toFixed(0)})`, ok: false });
     reasons.push({ t: 'MACD方向不明', ok: false });
@@ -1018,17 +1187,33 @@ async function _doScan() {
     const atr = a.atr || 0;
     const slDist = Math.abs(a.entry - a.sl);
     const candleRange = a.entry * 0.02; // 近似
+    // I4：VIX 市場恐慌過濾
+    const vix = vixCache.value;
+    if (vix > 35 && a.dir === 'long') { console.log(`🚨 ${pair} VIX=${vix.toFixed(1)}極度恐慌，否決做多`); continue; }
+    if (vix > 25 && vix <= 35 && a.score < MIN_SCORE + 5) { console.log(`⚠️ ${pair} VIX=${vix.toFixed(1)}市場謹慎，跳過`); continue; }
+ 
+    // F3：連續虧損動態門檻
+    const consecBonus = getConsecutiveBonus();
+    if (consecBonus >= 20 && a.score < MIN_SCORE + 20) { console.log(`🛑 ${pair} 連虧熔斷，跳過`); continue; }
+    else if (consecBonus > 0 && a.score < MIN_SCORE + consecBonus) { console.log(`⚠️ ${pair} 連虧保守門檻(+${consecBonus})，跳過`); continue; }
+ 
     // ── W4：時段動態門檻 ─────────────────────────────
     const twHour = new Date().toLocaleString('en-US', { timeZone: 'Asia/Taipei', hour: 'numeric', hour12: false });
     const h = parseInt(twHour);
     let sessionMinScore = MIN_SCORE;
     if (h >= 8 && h < 16) {
-      // 亞洲盤：成交量低、假突破多 → 門檻提高 +5
       sessionMinScore = MIN_SCORE + 5;
       if (a.score < sessionMinScore) { console.log(`🌏 ${pair} 亞洲盤門檻(${sessionMinScore})未達，跳過`); continue; }
+    } else if (h === 21 && new Date().getMinutes() < 30) {
+      // F2：美國開盤前15分（21:00-21:30）假突破最多
+      sessionMinScore = MIN_SCORE + 8;
+      if (a.score < sessionMinScore) { console.log(`⚠️ ${pair} 美開盤前門檻(${sessionMinScore})未達，跳過`); continue; }
     } else if (h >= 21 || h < 5) {
-      // 美國盤：成交量最大、機構主導 → 門檻降低 -3
       sessionMinScore = Math.max(MIN_SCORE - 3, 60);
+    } else if (h === 4 && new Date().getMinutes() < 30) {
+      // F2：美國收盤前（04:00-04:30）
+      sessionMinScore = MIN_SCORE + 5;
+      if (a.score < sessionMinScore) { console.log(`⚠️ ${pair} 美收盤前門檻(${sessionMinScore})未達，跳過`); continue; }
     }
     // （歐洲盤 16-21 使用標準門檻）
  
@@ -1093,7 +1278,7 @@ async function _doScan() {
       markPushed(pair, a);
       setCooldown(pair);
       recordSignal(pair, a.score, a.dir);
-      console.log(`✅ 推送完成：${pair}`);
+      console.log(`✅ 推送完成：${pair} [連虧:${dailyStats.consecutiveLoss||0}]`);
     }
     // #3 效能：最後一個訊號不等待
     if (si < toSend.length - 1) await new Promise(r => setTimeout(r, 1000));
@@ -1174,7 +1359,7 @@ app.get('/health', (req, res) => res.json({
 // 定時任務
 // ══════════════════════════════════════════════
 cron.schedule('*/2 * * * *', scanAndPush); // 加快取後 ~74 秒/輪，2 分鐘有 46 秒緩衝
-cron.schedule('*/15 * * * *', () => updateBtcTrend().catch(()=>{})); // BTC趨勢每15分鐘
+cron.schedule('*/15 * * * *', () => { updateBtcTrend().catch(()=>{}); updateVIX().catch(()=>{}); }); // BTC趨勢+VIX每15分鐘
  
 // 每6小時清理過期快取（防止記憶體洩漏）
 cron.schedule('0 */6 * * *', () => {
@@ -1216,8 +1401,9 @@ cron.schedule('0 20 * * *', async () => {
 cron.schedule('0 0 * * *', () => {
   dailyStats.dailyLoss = 0;
   dailyStats.isFused   = false;
-  dailyStats.signals   = [];
-  dailyStats.potential = [];
+  dailyStats.signals       = [];
+  dailyStats.potential     = [];
+  dailyStats.consecutiveLoss = 0; // F3: 連續虧損計數
   dailyStats.date      = new Date().toLocaleDateString('zh-TW', { timeZone: 'Asia/Taipei' });
   recentPushes.clear();   // 清除跨日去重快取
   signalCooldown.clear();  // 清除冷卻
@@ -1258,7 +1444,7 @@ app.listen(PORT, async () => {
  
   // 分散啟動：每個步驟間隔 5 秒，避免瞬間爆量
   setTimeout(async () => {
-    try { await updateBtcTrend(); } catch(e) {}
+    try { await updateBtcTrend(); await updateVIX(); } catch(e) {}
   }, 2000);
  
   setTimeout(() => console.log(`📊 監控：${WATCH_PAIRS.map(p=>p.replace('-USDT','')).join(' ')}`), 8000);
