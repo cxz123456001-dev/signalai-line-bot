@@ -143,12 +143,23 @@ const setCooldown = pair => signalCooldown.set(pair, Date.now());
  
 // ── 每日績效記錄 ─────────────────────────────────────
 const dailyStats = {
-  signals: [],
+  signals: [],       // 所有推送的訊號
+  results: [],       // 結果追蹤 { pair, dir, score, result:'win'|'loss'|'break', pnl, time }
   dailyLoss: 0,
   isFused: false,
   date: new Date().toLocaleDateString('zh-TW', { timeZone: 'Asia/Taipei' }),
 };
-const recordSignal = (pair, score, dir) => dailyStats.signals.push({ pair, score, dir, time: new Date().toLocaleTimeString('zh-TW', { timeZone: 'Asia/Taipei' }) });
+const recordSignal = (pair, score, dir) => dailyStats.signals.push({
+  pair, score, dir,
+  time: new Date().toLocaleTimeString('zh-TW', { timeZone: 'Asia/Taipei' })
+});
+const recordResult = (pair, dir, score, result, pnl = 0) => {
+  dailyStats.results.push({ pair, dir, score, result, pnl,
+    time: new Date().toLocaleTimeString('zh-TW', { timeZone: 'Asia/Taipei' }) });
+  // F3：連續虧損計數
+  if (result === 'loss') dailyStats.consecutiveLoss = (dailyStats.consecutiveLoss || 0) + 1;
+  else dailyStats.consecutiveLoss = 0; // 贏了就重置
+};
 function addDailyLoss(amount) {
   dailyStats.dailyLoss += amount;
   if (!dailyStats.isFused && dailyStats.dailyLoss >= DAILY_MAX_LOSS) {
@@ -1491,51 +1502,64 @@ async function checkTrackedSignals() {
   if (!trackedSignals.size) return;
   const now = Date.now();
   for (const [pair, sig] of trackedSignals.entries()) {
-    // 超過4小時的訊號自動移除
-    if (now - sig.ts > 4 * 60 * 60 * 1000) { trackedSignals.delete(pair); continue; }
+    const sym = pair.replace('-USDT','');
+    // 超過4小時 → 保本並移除
+    if (now - sig.ts > 4 * 60 * 60 * 1000) {
+      if (!sig.tp1Hit && !sig.slHit) recordResult(pair, sig.dir, sig.score||70, 'break', 0);
+      trackedSignals.delete(pair); continue;
+    }
     try {
-      // 取最新價格
       const candles = await fetchCached15m(pair).catch(() => []);
       if (!candles.length) continue;
       const price = candles[0].close;
-      const sym = pair.replace('-USDT','');
  
-      // 檢查是否達到 TP1（推送止損移動建議）
-      if (sig.dir === 'long' && price >= sig.tp1 && !sig.tp1Hit) {
-        sig.tp1Hit = true;
-        await discordPush(
-          `🎯 **${sym} 做多 TP1 達到！**
-現價：\`${price}\`
-💡 建議：止損移至進場價 \`${sig.entry}\`（保本）
-剩餘目標：TP2 \`${sig.tp2}\` / TP3 \`${sig.tp3}\``,
-          false, 0x00E578
-        );
-      } else if (sig.dir === 'short' && price <= sig.tp1 && !sig.tp1Hit) {
-        sig.tp1Hit = true;
-        await discordPush(
-          `🎯 **${sym} 做空 TP1 達到！**
-現價：\`${price}\`
-💡 建議：止損移至進場價 \`${sig.entry}\`（保本）
-剩餘目標：TP2 \`${sig.tp2}\` / TP3 \`${sig.tp3}\``,
-          false, 0x00E578
-        );
-      }
-      // TP2 達到
-      if (sig.tp1Hit) {
-        if (sig.dir === 'long'  && price >= sig.tp2 && !sig.tp2Hit) {
-          sig.tp2Hit = true;
-          await discordPush(`🎯 **${sym} 做多 TP2 達到！** 現價 \`${price}\`
-💡 建議：止損移至 TP1 \`${sig.tp1}\`（鎖定部分利潤）`, false, 0x00E578);
+      // ── 止損觸及 → 敗 ──────────────────────
+      if (!sig.slHit && !sig.tp1Hit) {
+        const slHit = sig.dir==='long' ? price<=sig.sl : price>=sig.sl;
+        if (slHit) {
+          sig.slHit = true;
+          recordResult(pair, sig.dir, sig.score||70, 'loss', -(sig.slAmount||0));
+          await discordPush(
+            `❌ **${sym} ${sig.dir==='long'?'做多':'做空'} 止損觸及**\n現價：\`${fmt(price)}\`  止損：\`${fmt(sig.sl)}\`\n虧損：-$${sig.slAmount||0}`,
+            false, 0xFF4466
+          );
+          trackedSignals.delete(pair); continue;
         }
-        if (sig.dir === 'short' && price <= sig.tp2 && !sig.tp2Hit) {
+      }
+ 
+      // ── TP1 達到 → 記錄勝 ─────────────────
+      if (!sig.tp1Hit) {
+        const tp1Hit = sig.dir==='long' ? price>=sig.tp1 : price<=sig.tp1;
+        if (tp1Hit) {
+          sig.tp1Hit = true;
+          recordResult(pair, sig.dir, sig.score||70, 'win', +(sig.tp1Amount||0));
+          await discordPush(
+            `🎯 **${sym} ${sig.dir==='long'?'做多':'做空'} TP1 達到！**\n現價：\`${fmt(price)}\`  +$${sig.tp1Amount||0}\n💡 建議止損移至進場價（保本）\n剩餘：TP2 \`${fmt(sig.tp2)}\` / TP3 \`${fmt(sig.tp3)}\``,
+            false, 0x00E578
+          );
+        }
+      }
+      // ── TP2 達到 ──────────────────────────
+      if (sig.tp1Hit && !sig.tp2Hit) {
+        const tp2Hit = sig.dir==='long' ? price>=sig.tp2 : price<=sig.tp2;
+        if (tp2Hit) {
           sig.tp2Hit = true;
-          await discordPush(`🎯 **${sym} 做空 TP2 達到！** 現價 \`${price}\`
-💡 建議：止損移至 TP1 \`${sig.tp1}\`（鎖定部分利潤）`, false, 0x00E578);
+          await discordPush(`🎯 **${sym} TP2 達到！** +$${sig.tp2Amount||0}\n💡 止損移至 TP1（鎖利）`, false, 0x00E578);
+        }
+      }
+      // ── TP3 達到 → 完全勝 ─────────────────
+      if (sig.tp2Hit && !sig.tp3Hit) {
+        const tp3Hit = sig.dir==='long' ? price>=sig.tp3 : price<=sig.tp3;
+        if (tp3Hit) {
+          sig.tp3Hit = true;
+          await discordPush(`🏆 **${sym} TP3 全達！** +$${sig.tp3Amount||0} 🎉`, false, 0xFFD700);
+          trackedSignals.delete(pair);
         }
       }
     } catch(e) {}
   }
 }
+ 
 // ══════════════════════════════════════════════
 // S4：加密新聞即時偵測（cryptocurrency.cv 免費）
 // ══════════════════════════════════════════════
@@ -1603,22 +1627,50 @@ cron.schedule('0 */6 * * *', () => {
 // 每天 20:00 推送今日績效摘要
 cron.schedule('0 20 * * *', async () => {
   try {
-    const sigs = dailyStats.signals;
+    const sigs    = dailyStats.signals;
+    const results = dailyStats.results || [];
     if (!sigs.length) return;
-    const strong = sigs.filter(s => s.score >= 80).length;
-    const mid    = sigs.filter(s => s.score >= 70 && s.score < 80).length;
-    const longs  = sigs.filter(s => s.dir === 'long').length;
-    const shorts = sigs.filter(s => s.dir === 'short').length;
+ 
+    // 勝率計算
+    const wins   = results.filter(r => r.result === 'win').length;
+    const losses = results.filter(r => r.result === 'loss').length;
+    const breaks = results.filter(r => r.result === 'break').length;
+    const total  = wins + losses + breaks;
+    const winRate = total > 0 ? Math.round(wins / total * 100) : null;
+    const totalPnl = results.reduce((s, r) => s + (r.pnl || 0), 0);
+ 
+    // 按評分分組的勝率
+    const highScoreWins = results.filter(r => r.score >= 80 && r.result === 'win').length;
+    const highScoreTotal = results.filter(r => r.score >= 80).length;
+    const highWinRate = highScoreTotal > 0 ? Math.round(highScoreWins/highScoreTotal*100) : null;
+ 
+    const strong   = sigs.filter(s => s.score >= 80).length;
+    const mid      = sigs.filter(s => s.score >= 70 && s.score < 80).length;
+    const longs    = sigs.filter(s => s.dir === 'long').length;
+    const shorts   = sigs.filter(s => s.dir === 'short').length;
     const avgScore = Math.round(sigs.reduce((s,x) => s+x.score, 0) / sigs.length);
-    const topPairs = Object.entries(sigs.reduce((acc, s) => {
+    const topPairs = Object.entries(sigs.reduce((acc,s) => {
       acc[s.pair] = (acc[s.pair]||0)+1; return acc;
     }, {})).sort((a,b)=>b[1]-a[1]).slice(0,3).map(([p,n])=>`${p.replace('-USDT','')}(${n})`).join(' ');
+ 
+    const winRateBar = winRate !== null
+      ? `${'🟩'.repeat(Math.round(winRate/10))}${'⬜'.repeat(10-Math.round(winRate/10))} ${winRate}%`
+      : '追蹤中...';
+ 
     const summary =
       `📊 **今日訊號摘要** ${dailyStats.date}\n` +
       `──────────────\n` +
-      `總訊號：**${sigs.length}** 個（🔴強${strong} 🟡中${mid}）\n` +
-      `做多：${longs} · 做空：${shorts}\n` +
-      `平均評分：**${avgScore}**/100\n` +
+      `總推送：**${sigs.length}** 個（🔴強${strong} 🟡中${mid}）\n` +
+      `做多：${longs} · 做空：${shorts} · 平均分：**${avgScore}**\n` +
+      `──────────────\n` +
+      (total > 0 ?
+        `🏆 **今日勝率**\n${winRateBar}\n` +
+        `✅ 勝 ${wins} · ❌ 敗 ${losses} · ➡️ 平 ${breaks}\n` +
+        `💰 今日損益：${totalPnl >= 0 ? '+' : ''}$${totalPnl.toFixed(2)}\n` +
+        (highWinRate !== null ? `📈 強訊號(≥80分)勝率：**${highWinRate}%**\n` : '') :
+        `⏳ 今日追蹤中（${trackedSignals.size}個進行中）\n`
+      ) +
+      `──────────────\n` +
       `最多幣種：${topPairs}\n` +
       `今日虧損：$${dailyStats.dailyLoss.toFixed(2)}/$${DAILY_MAX_LOSS}`;
     await discordPush(summary, false);
@@ -1629,9 +1681,10 @@ cron.schedule('0 20 * * *', async () => {
 cron.schedule('0 0 * * *', () => {
   dailyStats.dailyLoss = 0;
   dailyStats.isFused   = false;
-  dailyStats.signals       = [];
-  dailyStats.potential     = [];
-  dailyStats.consecutiveLoss = 0; // F3: 連續虧損計數
+  dailyStats.signals         = [];
+  dailyStats.results         = [];  // 清空結果追蹤
+  dailyStats.potential       = [];
+  dailyStats.consecutiveLoss = 0;
   dailyStats.date      = new Date().toLocaleDateString('zh-TW', { timeZone: 'Asia/Taipei' });
   recentPushes.clear();   // 清除跨日去重快取
   signalCooldown.clear();  // 清除冷卻
