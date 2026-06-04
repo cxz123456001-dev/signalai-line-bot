@@ -1026,8 +1026,8 @@ async function analyze(instId) {
   if (last.close > boll.upper)                             longPts  += 1;
   if (last.close < boll.lower)                             shortPts += 1;
  
-  if      (longPts  >= shortPts + 3) dir = 'long';  // V1：放寬至 3
-  else if (shortPts >= longPts  + 3) dir = 'short';
+  if      (longPts  >= shortPts + 4) dir = 'long';  // 方向需差4分才確認
+  else if (shortPts >= longPts  + 4) dir = 'short';
  
   // ── 方案 A：4H 共振加減分 ──────────────────────────
   // 4H 和 1H 同向 → +15；反向 → -20（幾乎無法過門檻）
@@ -1070,13 +1070,13 @@ async function analyze(instId) {
     const atrStop = entry   - atrSL;
     // 取較近的止損，但不超過 ATR 止損 1.5 倍，且至少距離 0.5 ATR
     sl = Math.max(Math.max(keyStop, atrStop), entry - atrSL * 1.5);
-    sl = Math.min(sl, entry - atr * 0.5);
+    sl = Math.min(sl, entry * (1 - 0.005)); // 最少 0.5% 距離
   } else if (dir === 'short') {
     const keyHigh = Math.max(...prev10.map(c => c.high)); // 前10根最高點
     const keyStop = keyHigh + atr * 0.3;
     const atrStop = entry   + atrSL;
     sl = Math.min(Math.min(keyStop, atrStop), entry + atrSL * 1.5);
-    sl = Math.max(sl, entry + atr * 0.5);
+    sl = Math.max(sl, entry * (1 + 0.005)); // 最少 0.5% 距離
   } else {
     sl = dir === 'long' ? entry - atrSL : entry + atrSL;
   }
@@ -1279,6 +1279,25 @@ async function _doScan() {
       if (trumpCache.sentiment === 'geo') { console.log(`🌍 ${pair} 地緣政治警戒，跳過`); continue; }
     }
  
+    // 方向平衡過濾（防止全部同一方向）
+    // BTC 空頭 → 多單需要 85 分（已有），空單仍正常
+    // BTC 多頭 → 空單需要 85 分（已有），多單仍正常
+    const todaySigs = dailyStats.signals;
+    if (todaySigs.length >= 10) {
+      const todayShorts = todaySigs.filter(s => s.dir === 'short').length;
+      const shortRatio  = todayShorts / todaySigs.length;
+      const todayLongs  = todaySigs.filter(s => s.dir === 'long').length;
+      const longRatio   = todayLongs / todaySigs.length;
+      // 做空比例 > 80% → 做空訊號額外需要 +8 分
+      if (shortRatio > 0.7 && a.dir === 'short' && a.score < MIN_SCORE + 10) {
+        console.log(`⚖️ ${pair} 今日做空比例過高(${Math.round(shortRatio*100)}%)，跳過`); continue;
+      }
+      // 做多比例 > 80% → 做多訊號額外需要 +8 分
+      if (longRatio > 0.7 && a.dir === 'long' && a.score < MIN_SCORE + 10) {
+        console.log(`⚖️ ${pair} 今日做多比例過高(${Math.round(longRatio*100)}%)，跳過`); continue;
+      }
+    }
+ 
     // I4：VIX 市場恐慌過濾
     const vix = vixCache.value;
     if (vix > 35 && a.dir === 'long') { console.log(`🚨 ${pair} VIX=${vix.toFixed(1)}極度恐慌，否決做多`); continue; }
@@ -1309,6 +1328,11 @@ async function _doScan() {
     }
     // （歐洲盤 16-21 使用標準門檻）
  
+    // ADX 極弱否決（ADX < 15 趨勢完全不可信）
+    if ((a.adx || 0) < 15 && !a.tripleBreak?.bullBreak && !a.tripleBreak?.bearBreak) {
+      console.log(`🚫 ${pair} ADX極弱(${(a.adx||0).toFixed(0)})，否決`); continue;
+    }
+ 
     // D1：RSI 極端值（做多時過熱，做空時過賣）
     const rsi = a.rsi || 50;
     if (a.dir === 'long'  && rsi > 75) { console.log(`🚫 ${pair} RSI過熱(${rsi.toFixed(0)})，否決做多`); continue; }
@@ -1317,8 +1341,8 @@ async function _doScan() {
     if (a.flow5m?.volSurge < 0.5) { console.log(`🚫 ${pair} 成交量極萎縮(${a.flow5m.volSurge.toFixed(2)}x)，否決`); continue; }
     // D3：止損距離過大（slDist / entry > 3%，風險過高）
     if (a.entry > 0 && slDist / a.entry > 0.03) { console.log(`🚫 ${pair} 止損過大(${(slDist/a.entry*100).toFixed(1)}%)，否決`); continue; }
-    // D4：止損距離過小（slDist / entry < 0.2%，容易被掃）
-    if (a.entry > 0 && slDist / a.entry < 0.002) { console.log(`🚫 ${pair} 止損過近(${(slDist/a.entry*100).toFixed(2)}%)，否決`); continue; }
+    // D4：止損距離過小（slDist / entry < 0.5%，容易被掃）
+    if (a.entry > 0 && slDist / a.entry < 0.005) { console.log(`🚫 ${pair} 止損過近(${(slDist/a.entry*100).toFixed(2)}%)，否決`); continue; }
  
     // ── 方案 C：波動率過濾（ATR% 甜蜜區間）──────────
     const atrPct = a.entry > 0 ? (a.atr || 0) / a.entry : 0;
@@ -1346,7 +1370,9 @@ async function _doScan() {
   const strong = pushable.filter(s => s.a.score >= 80);
   const medium = pushable.filter(s => s.a.score < 80);
   // 強訊號全推，中訊號只取前 2
-  const toSend = [...strong, ...medium.slice(0, 2)];
+  // 只有強訊號全推；中訊號只在 BTC 非單邊行情才推（減少雜訊）
+  const mediumAllowed = btcTrend === 'neutral' ? medium.slice(0, 1) : [];
+  const toSend = [...strong, ...mediumAllowed];
   const skipped = medium.slice(2);
   if (skipped.length > 0) {
     console.log(`  略過低分訊號：${skipped.map(s=>`${s.pair.replace('-USDT','')}(${s.a.score})`).join(' ')}`);
