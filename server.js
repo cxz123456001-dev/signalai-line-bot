@@ -333,7 +333,8 @@ function calcTrendSignals(candles) {
 // ── ATR 動態倍數（方案E）────────────────────────────
 function getATRMultiplier(atr, candles) {
   const avg = candles.slice(0,20).reduce((s,c,i)=>{const p=candles[i+1]; return p?s+Math.max(c.high-c.low,Math.abs(c.high-p.close),Math.abs(c.low-p.close)):s;},0)/20;
-  return atr < avg*0.7 ? 1.2 : atr > avg*1.5 ? 2.0 : 1.5;
+  // 縮小乘數確保止損在合理範圍（目標 0.8-1.5%）
+  return atr < avg*0.7 ? 0.8 : atr > avg*1.5 ? 1.2 : 1.0;
 }
  
  
@@ -1100,9 +1101,9 @@ async function analyze(instId) {
   const slDist = Math.abs(entry - sl);
  
   // 止盈分3等分
-  const tp1 = dir === 'long' ? entry + slDist : entry - slDist;         // 1:1
-  const tp2 = dir === 'long' ? entry + slDist * 1.8 : entry - slDist * 1.8; // 1:1.8
-  const tp3 = dir === 'long' ? entry + slDist * 3.0 : entry - slDist * 3.0; // 1:3
+  const tp1 = dir === 'long' ? entry + slDist * 0.8 : entry - slDist * 0.8; // TP1縮短更易達到         // 1:1
+  const tp2 = dir === 'long' ? entry + slDist * 1.5 : entry - slDist * 1.5; // 1:1.8
+  const tp3 = dir === 'long' ? entry + slDist * 2.5 : entry - slDist * 2.5; // 1:2.5
  
   // 動態槓桿評估
   let leverage = 5;
@@ -1129,9 +1130,9 @@ async function analyze(instId) {
   const finalLeverage = Math.max(1, safeLeverage);
   const positionSize = capital * finalLeverage;
   const slAmount = (positionSize * slPct).toFixed(2);
-  const tp1Amount = (positionSize * (slDist / entry)).toFixed(2);
-  const tp2Amount = (positionSize * (slDist * 1.8 / entry)).toFixed(2);
-  const tp3Amount = (positionSize * (slDist * 3 / entry)).toFixed(2);
+  const tp1Amount = (positionSize * (slDist * 0.8 / entry)).toFixed(2);
+  const tp2Amount = (positionSize * (slDist * 1.5 / entry)).toFixed(2);
+  const tp3Amount = (positionSize * (slDist * 2.5 / entry)).toFixed(2);
   const fee = (positionSize * 0.0005).toFixed(2);
  
   // 合約張數估算（以 1 USDT/張 粗估，實際依幣種合約面值）
@@ -1139,7 +1140,7 @@ async function analyze(instId) {
  
   return {
     score, dir, reasons, entry, sl, tp1, tp2, tp3,
-    rr: '1:1.8', atr, atrMult, leverage: finalLeverage,
+    rr: '1:1.5', atr, atrMult, leverage: finalLeverage,
     capital, positionSize: positionSize.toFixed(2),
     slAmount, tp1Amount, tp2Amount, tp3Amount, fee,
     doubleCapital, flow5m, rsi, macd, swapSz,
@@ -1370,7 +1371,7 @@ async function _doScan() {
     // D2：成交量極度萎縮（volSurge < 0.5，假突破風險極高）
     if (a.flow5m?.volSurge < 0.5) { console.log(`🚫 ${pair} 成交量極萎縮(${a.flow5m.volSurge.toFixed(2)}x)，否決`); continue; }
     // D3：止損距離過大（slDist / entry > 3%，風險過高）
-    if (a.entry > 0 && slDist / a.entry > 0.03) { console.log(`🚫 ${pair} 止損過大(${(slDist/a.entry*100).toFixed(1)}%)，否決`); continue; }
+    if (a.entry > 0 && slDist / a.entry > 0.02) { console.log(`🚫 ${pair} 止損過大(${(slDist/a.entry*100).toFixed(1)}%)，否決`); continue; }
     // D4：止損距離過小（slDist / entry < 0.5%，容易被掃）
     if (a.entry > 0 && slDist / a.entry < 0.005) { console.log(`🚫 ${pair} 止損過近(${(slDist/a.entry*100).toFixed(2)}%)，否決`); continue; }
  
@@ -1381,6 +1382,10 @@ async function _doScan() {
  
     // 強訊號（≥85）跳過冷卻限制
     if (isOnCooldown(pair) && a.score < 85) continue;
+    // 量能萎縮否決（reasons 裡有量能萎縮就跳過）
+    if (a.reasons?.some(r => r.t?.includes('量能萎縮') && !r.ok)) {
+      console.log(`🚫 ${pair} 量能萎縮否決`); continue;
+    }
     if (isDuplicatePush(pair, a)) { console.log(`⏭ 重複略過 ${pair}`); continue; }
     validSignals.push({ pair, a });
   }
@@ -1560,7 +1565,7 @@ async function checkTrackedSignals() {
   for (const [pair, sig] of trackedSignals.entries()) {
     const sym = pair.replace('-USDT','');
     // 超過4小時 → 保本並移除
-    if (now - sig.ts > 4 * 60 * 60 * 1000) {
+    if (now - sig.ts > 8 * 60 * 60 * 1000) { // 延長至8小時
       if (!sig.tp1Hit && !sig.slHit) recordResult(pair, sig.dir, sig.score||70, 'break', 0);
       trackedSignals.delete(pair); continue;
     }
