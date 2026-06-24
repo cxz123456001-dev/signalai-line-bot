@@ -1488,6 +1488,29 @@ app.post('/webhook', middleware(lineConfig), async (req, res) => {
           `共 ${WATCH_PAIRS.length} 個幣對`,
       });
  
+    } else if (text.startsWith('今日數據 ') || text.startsWith('數據 ')) {
+      // 手動新增今日臨時經濟事件（格式：今日數據 CPI 或 今日數據 CPI 21:30）
+      const input = text.replace(/^(今日數據|數據)\s+/, '').trim();
+      const parts = input.split(/\s+/);
+      const name = parts[0] || 'CPI';
+      const timePart = parts[1] || '21:30';
+      const [hStr, mStr] = timePart.split(':');
+      const hour = parseInt(hStr) || 21;
+      const minute = parseInt(mStr) || 30;
+      // 加入今日臨時事件（只對今天有效，不影響 ECONOMIC_EVENTS）
+      const now = new Date();
+      const tpe = new Date(now.toLocaleString('en-US', { timeZone: 'Asia/Taipei' }));
+      ECONOMIC_EVENTS.push({ name: `今日 ${name}`, hour, minute, dayOfWeek: tpe.getDay(), impact: 'high', temp: true });
+      // 清除明天過期的臨時事件
+      setTimeout(() => {
+        const idx = ECONOMIC_EVENTS.findIndex(e => e.temp && e.name.startsWith('今日'));
+        if (idx !== -1) ECONOMIC_EVENTS.splice(idx, 1);
+      }, 24 * 60 * 60 * 1000);
+      await client.replyMessage(tok, {
+        type: 'text',
+        text: `✅ 今日臨時數據已加入\n📅 ${name} ${hour}:${String(minute).padStart(2,'0')}\n⚠️ 發布前後30分鐘將暫停訊號`,
+      });
+ 
     } else {
       await client.replyMessage(tok, {
         type: 'text',
@@ -1516,14 +1539,15 @@ app.get('/health', (req, res) => res.json({
 // 固定重大事件時間（台北時間，每月更新）
 // CPI 通常每月第2-3週，非農第1個週五，Fed 每6週
 const ECONOMIC_EVENTS = [
-  // 格式：{ name, hour, minute, dayOfWeek(-1=any), impact }
-  // 每月固定時間（只設常見時段）
-  { name: '美國 CPI',       hour: 21, minute: 30, dayOfWeek: -1, impact: 'high' },
-  { name: '美國非農就業',    hour: 21, minute: 30, dayOfWeek:  5, impact: 'high' }, // 週五
-  { name: 'Fed 利率決議',   hour: 2,  minute: 0,  dayOfWeek: -1, impact: 'high' },
-  { name: '美國 PCE',       hour: 21, minute: 30, dayOfWeek: -1, impact: 'medium' },
-  { name: '美國 GDP',       hour: 21, minute: 30, dayOfWeek: -1, impact: 'medium' },
-  { name: '美國零售銷售',    hour: 21, minute: 30, dayOfWeek: -1, impact: 'medium' },
+  // dayOfWeek: -1 = 每月特定日，需手動觸發（不自動推送）
+  // dayOfWeek: 0-6 = 固定星期，每週或每月同一天
+  { name: '美國非農就業',  hour: 21, minute: 30, dayOfWeek: 5, impact: 'high' },   // 每月第1個週五
+  { name: 'Fed 利率決議',  hour: 2,  minute: 0,  dayOfWeek: 3, impact: 'high' },   // 每6週週三
+  // 以下為每月不固定，設 -1 不自動推（避免每天誤推）
+  { name: '美國 CPI',      hour: 21, minute: 30, dayOfWeek: -1, impact: 'high' },
+  { name: '美國 PCE',      hour: 21, minute: 30, dayOfWeek: -1, impact: 'medium' },
+  { name: '美國 GDP',      hour: 21, minute: 30, dayOfWeek: -1, impact: 'medium' },
+  { name: '美國零售銷售',   hour: 21, minute: 30, dayOfWeek: -1, impact: 'medium' },
 ];
  
 function isNearEconomicEvent() {
@@ -1544,14 +1568,37 @@ function isNearEconomicEvent() {
  
 async function sendDailyEconomicCalendar() {
   // 每天早上9點推送今日重要事件
-  const today = new Date().toLocaleDateString('zh-TW', { timeZone:'Asia/Taipei', weekday:'short' });
-  const events = ECONOMIC_EVENTS.filter(e => {
-    const dow = new Date().toLocaleString('en-US', { timeZone:'Asia/Taipei', weekday:'long' });
-    return e.dayOfWeek === -1 || e.dayOfWeek === ['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'].indexOf(dow);
+  // 只推送今天 dayOfWeek 符合的事件
+  const now  = new Date();
+  const tpe  = new Date(now.toLocaleString('en-US', { timeZone: 'Asia/Taipei' }));
+  const dow  = tpe.getDay(); // 0=日,1=一,...,6=六
+  const today = now.toLocaleDateString('zh-TW', { timeZone:'Asia/Taipei', weekday:'short' });
+ 
+  // 只保留今天星期幾對應的事件
+  // dayOfWeek: -1 代表「每月固定，需人工確認」
+  // 每月只有特定幾天才有 CPI/PCE/GDP 等，不能每天都推
+  // 解法：只在特定條件下才推
+  //   非農 → 只在週五推
+  //   其他 → dayOfWeek: -1 的事件只在「有已知實際日期」時推
+  // 目前做法：只推 dayOfWeek 明確符合今天星期的事件（避免誤推）
+  const todayEvents = ECONOMIC_EVENTS.filter(e => {
+    if (e.dayOfWeek === -1) return false; // 不明確日期的不自動推
+    return e.dayOfWeek === dow;
   });
-  if (!events.length) return;
-  const list = events.map(e => `• ${e.name} ${e.hour}:${String(e.minute).padStart(2,'0')} ${e.impact==='high'?'🔴':'🟡'}`).join('\n');
-  await discordPush(`📅 **今日重要經濟數據** (${today})\n─────────────────\n${list}\n─────────────────\n🔴=高影響 · 建議發布前後30分謹慎開倉`, false).catch(()=>{});
+ 
+  if (!todayEvents.length) {
+    console.log('📅 今日無預設重要經濟數據');
+    return;
+  }
+ 
+  const list = todayEvents.map(e =>
+    `• ${e.name} ${e.hour}:${String(e.minute).padStart(2,'0')} ${e.impact==='high'?'🔴':'🟡'}`
+  ).join('\n');
+ 
+  await discordPush(
+    `📅 **今日重要經濟數據** (${today})\n─────────────────\n${list}\n─────────────────\n🔴=高影響 · 建議發布前後30分謹慎開倉`,
+    false
+  ).catch(()=>{});
 }
  
 // ══════════════════════════════════════════════
@@ -1796,4 +1843,3 @@ app.listen(PORT, async () => {
     try { await scanAndPush(); } catch(e) {}
   }, 20000); // 啟動 20 秒後才開始第一次掃描
 });
- 
