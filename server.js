@@ -381,7 +381,7 @@ const rateLimiter = {
   queue: [],
   running: 0,
   maxConcurrent: 1,        // 單一並行
-  minInterval: 600,        // 每個請求間隔 600ms
+  minInterval: 400, // 加快：600→400ms        // 每個請求間隔 600ms
   lastCallTime: 0,
  
   async acquire() {
@@ -1248,7 +1248,7 @@ async function _doScan() {
         r = await analyze(pair).then(a => ({ pair, a })).catch(e => ({ status:'rejected', reason:e }));
       }
       _res.push({ status:'fulfilled', value: r });
-      if (i < pairs.length - 1) await new Promise(x => setTimeout(x, 600));
+      if (i < pairs.length - 1) await new Promise(x => setTimeout(x, 300)); // 加快：600→300ms
     }
     return _res;
   }
@@ -1843,3 +1843,4 @@ app.listen(PORT, async () => {
     try { await scanAndPush(); } catch(e) {}
   }, 20000); // 啟動 20 秒後才開始第一次掃描
 });
+ 
